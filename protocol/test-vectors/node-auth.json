@@ -1,0 +1,15 @@
+{
+  "scheme": "node_auth_token = base64(HMAC-SHA256(key=utf8(owner_token), msg=utf8(node_id)))",
+  "cases": [
+    {
+      "owner_token": "korat_owner_test_token_AAAA",
+      "node_id": "11111111111111111111111111111111",
+      "node_auth_token_base64": "RDZcWZ2gj1ps5r4/F5coZQ9rt9Or7xhOLAOx3UJ6q6I="
+    },
+    {
+      "owner_token": "korat_owner_test_token_BBBB",
+      "node_id": "22222222222222222222222222222222",
+      "node_auth_token_base64": "WscYk5QnD3I\u002B4GEIreVDJp5XKEJybVQST6W3iFtu8kg="
+    }
+  ]
+}

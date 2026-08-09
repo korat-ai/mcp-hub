@@ -1,0 +1,48 @@
+# .NET
+bin/
+obj/
+TestResults/
+*.user
+*.suo
+*.rsuser
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+logs/
+
+# Build artifacts
+artifacts/
+dist/
+
+# Node (Cloudflare Worker under infra/install-worker)
+node_modules/
+package-lock.json
+# …but DO track the SPA lockfile — CI's `npm ci` + npm cache require it in the repo
+# (without it the Frontend job fails: "Some specified paths were not resolved").
+!apps/Korat.App/package-lock.json
+
+# Frontend build output (committed by CI; do not include in source commits)
+apps/Korat.Cloud/wwwroot/app/
+
+# Working scratch for comprehensive audit (not for commit)
+.audit/
+.claude/worktrees/
+.playwright-mcp/
+.superpowers/
+
+# Local MCP client configuration may contain machine-specific paths or credentials.
+.mcp.json
+apps/Korat.App/coverage/

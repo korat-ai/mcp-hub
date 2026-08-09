@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 220 160" role="img" aria-label="Korat — poster mark">
+  
+  <g transform="translate(8 0) skewX(-9)">
+    
+    <g fill="oklch(0.93 0.025 82)" transform="translate(-5 5)">
+      <rect x="20" y="10" width="26" height="140"></rect>
+      <path d="M46,68 L130,10 L154,10 L46,80 Z"></path>
+      <path d="M46,80 L154,150 L130,150 L46,92 Z"></path>
+    </g>
+    
+    <g fill="oklch(0.18 0.02 60)">
+      <rect x="20" y="10" width="26" height="140"></rect>
+      <path d="M46,68 L130,10 L154,10 L46,80 Z"></path>
+      <path d="M46,80 L154,150 L130,150 L46,92 Z"></path>
+    </g>
+  </g>
+  
+  <circle cx="185" cy="80" r="13" fill="oklch(0.66 0.17 32)"></circle>
+</svg>

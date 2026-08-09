@@ -1,0 +1,14 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Orleans.Sdk" />
+    <PackageReference Include="Microsoft.Orleans.Serialization.SystemTextJson" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Korat.Domain\Korat.Domain.csproj" />
+    <ProjectReference Include="..\Korat.GrainInterfaces\Korat.GrainInterfaces.csproj" />
+    <ProjectReference Include="..\Korat.Persistence\Korat.Persistence.csproj" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,15 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: korat-postgres
+    environment:
+      POSTGRES_USER: korat
+      POSTGRES_PASSWORD: korat
+      POSTGRES_DB: korat
+    ports:
+      - "5432:5432"
+    volumes:
+      - korat_pg_data:/var/lib/postgresql/data
+
+volumes:
+  korat_pg_data:

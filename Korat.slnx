@@ -1,0 +1,24 @@
+<Solution>
+  <Folder Name="/apps/">
+    <Project Path="apps/Korat.Cli/Korat.Cli.csproj" />
+    <Project Path="apps/Korat.Cloud/Korat.Cloud.csproj" />
+    <Project Path="apps/Korat.Demo.EchoMcp/Korat.Demo.EchoMcp.csproj" />
+  </Folder>
+  <Folder Name="/src/">
+    <Project Path="src/Korat.Domain/Korat.Domain.csproj" />
+    <Project Path="src/Korat.GrainInterfaces/Korat.GrainInterfaces.csproj" />
+    <Project Path="src/Korat.Grains/Korat.Grains.csproj" />
+    <Project Path="src/Korat.Mcp/Korat.Mcp.csproj" />
+    <Project Path="src/Korat.Persistence/Korat.Persistence.csproj" />
+    <Project Path="src/Korat.Protocol/Korat.Protocol.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Korat.Auth.Tests/Korat.Auth.Tests.csproj" />
+    <Project Path="tests/Korat.Cli.Tests/Korat.Cli.Tests.csproj" />
+    <Project Path="tests/Korat.Cloud.ContractTests/Korat.Cloud.ContractTests.csproj" />
+    <Project Path="tests/Korat.Cloud.IntegrationTests/Korat.Cloud.IntegrationTests.csproj" />
+    <Project Path="tests/Korat.Domain.Tests/Korat.Domain.Tests.csproj" />
+    <Project Path="tests/Korat.Persistence.Tests/Korat.Persistence.Tests.csproj" />
+    <Project Path="tests/Korat.Protocol.Tests/Korat.Protocol.Tests.csproj" />
+  </Folder>
+</Solution>

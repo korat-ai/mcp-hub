@@ -1,0 +1,52 @@
+{
+  "scheme": "AES-256-GCM v1; nonce=dir(1)||0x000000(3)||seq(8BE); AAD=\u0027korat-frame-v1\u0027||sessionId||0x00||dir||seq(8BE)||SHA256(meta); wire=tag(16)||ct",
+  "cases": [
+    {
+      "name": "roundtrip_c2s_seq0_no_meta",
+      "key_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "session_id": "test-session-031",
+      "dir": "0x00",
+      "seq": 0,
+      "plaintext_utf8": "hello korat e2e",
+      "wire_hex": "8b5faeb410f1bf5c26abfae3a613fe3c66d9d9b2da0ce8d27ac9dd157d1ef4"
+    },
+    {
+      "name": "roundtrip_s2c_seq0_no_meta",
+      "key_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "session_id": "test-session-031",
+      "dir": "0x01",
+      "seq": 0,
+      "plaintext_utf8": "response from publisher",
+      "wire_hex": "6e76e052e8fdb156a995e1e3a9bbc3119049f14fcbc19f626a6277ac51e1f8beae0da65d14cd19"
+    },
+    {
+      "name": "tampered_tag_must_fail",
+      "key_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "session_id": "test-session-031",
+      "dir": "0x00",
+      "seq": 0,
+      "wire_hex": "745faeb410f1bf5c26abfae3a613fe3c66d9d9b2da0ce8d27ac9dd157d1ef4",
+      "expect": "decrypt_error"
+    },
+    {
+      "name": "tampered_ciphertext_must_fail",
+      "key_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "session_id": "test-session-031",
+      "dir": "0x00",
+      "seq": 0,
+      "wire_hex": "8b5faeb410f1bf5c26abfae3a613fe3c66d9d9b2da0ce8d27ac9dd157d1e0b",
+      "expect": "decrypt_error"
+    },
+    {
+      "name": "wrong_direction_must_fail",
+      "key_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "session_id": "test-session-031",
+      "sealed_dir": "0x00",
+      "open_with_dir": "0x01",
+      "seq": 0,
+      "wire_hex": "8b5faeb410f1bf5c26abfae3a613fe3c66d9d9b2da0ce8d27ac9dd157d1ef4",
+      "expect": "decrypt_error",
+      "note": "direction byte is part of nonce; wrong dir \u2192 different nonce \u2192 AEAD fail"
+    }
+  ]
+}

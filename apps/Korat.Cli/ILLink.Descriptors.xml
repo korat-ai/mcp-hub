@@ -1,0 +1,14 @@
+<!--
+  Trimmer roots for third-party assemblies that use reflection internally.
+  Without this file, PublishTrimmed=true strips types/methods that Sentry
+  accesses at runtime via reflection, causing silent no-ops or crashes.
+
+  The Sentry .NET SDK serialises events using internal reflection-based code.
+  Rooting the entire Sentry assembly is the safe, maintainable approach — the
+  SDK already ships trim-suppressions ([UnconditionalSuppressMessage]) for its
+  own analysis warnings, so we are not silencing real trimmer findings; we are
+  simply telling the linker "keep everything in Sentry.*".
+-->
+<linker>
+  <assembly fullname="Sentry" preserve="all" />
+</linker>

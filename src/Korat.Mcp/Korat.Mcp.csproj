@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Р32: the MCP wire and aggregation contracts shared by the Cloud's Space-MCP endpoint and the
+    CLI's local aggregator. Deliberately dependency-free (System.Text.Json only) so both a
+    server-side host and a single-binary CLI can reference it without pulling anything else in.
+
+    Only types that are genuinely ONE concept live here. Types that merely share a NAME across the
+    two sides stayed where they were — see docs/oss-triage/decisions.md, Р32.
+  -->
+
+</Project>

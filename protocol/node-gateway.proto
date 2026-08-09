@@ -1,0 +1,361 @@
+syntax = "proto3";
+
+package korat.relay.v1;
+
+// NodeGatewayService is the node-to-cloud relay/control stream. Payload bytes
+// carried in RelayFrame.ciphertext are opaque to the cloud.
+service NodeGatewayService {
+  rpc Connect(stream NodeToGatewayMessage) returns (stream GatewayToNodeMessage);
+}
+
+message NodeToGatewayMessage {
+  oneof payload {
+    NodeHello hello = 1;
+    Heartbeat heartbeat = 2;
+    PublishMcpServer publish_mcp_server = 3;
+    RequestSession request_session = 4;
+    RelayFrame frame = 5;
+    CloseSession close_session = 6;
+    UnpublishMcpServer unpublish_mcp_server = 7;
+    SyncMcpServers sync_mcp_servers = 8;
+    // 030 (additive): mobile node reports its APNs push token so the cloud can wake it
+    // when an agent requests a session while the node is offline. Sent after Hello whenever
+    // the token is (re)issued by the OS — may arrive at any point in the stream and may
+    // repeat (idempotent upsert). Old nodes never send it and keep working unchanged.
+    RegisterPushToken     register_push_token     = 12; // node → cloud: register/refresh APNs token
+    // 031 (additive): E2E key-exchange messages. Relay-mediated, authenticated by existing
+    // Bearer/HMAC stream identity. Old peers skip unknown oneof cases (default switch falls
+    // through) → timeout → plaintext + downgrade warning. Fields 1–12 untouched.
+    E2eKeyOffer   e2e_key_offer   = 13; // agent → cloud → publisher: initiate ECDH
+    E2eKeyAnswer  e2e_key_answer  = 14; // publisher → cloud → agent: respond with own pubkey + confirm
+    E2eKeyConfirm e2e_key_confirm = 15;
+  }
+
+  // Номера 9, 10, 11, 16, 17 занимала агент-платформа (publish/unpublish/sync inference
+  // point, inference_chunk, inference_end). Платформа удалена; номера ЗАРЕЗЕРВИРОВАНЫ,
+  // потому что развёрнутые узлы всё ещё могут их прислать — переиспользование номера
+  // заставило бы облако разобрать эти байты как новое сообщение.
+  reserved 9, 10, 11, 16, 17;
+}
+
+message GatewayToNodeMessage {
+  oneof payload {
+    GatewayHello hello = 1;
+    HeartbeatAck heartbeat_ack = 2;
+    AccessPending access_pending = 3;
+    AccessDenied access_denied = 4;
+    SessionOpened session_opened = 5;
+    RelayFrame frame = 6;
+    CloseSession close_session = 7;
+    PayloadLimitExceeded payload_limit_exceeded = 8;
+    PublishMcpServerAck publish_mcp_server_ack = 9;
+    // 031 (additive): E2E key-exchange messages forwarded by the relay. Fields 1–12 untouched.
+    E2eKeyOffer      e2e_key_offer      = 13; // cloud → publisher: forward agent's offer
+    E2eKeyAnswer     e2e_key_answer     = 14; // cloud → agent: forward publisher's answer
+    E2eKeyConfirm    e2e_key_confirm    = 15; // cloud → publisher: forward agent's confirm
+    E2eNotSupported  e2e_not_supported  = 16; // cloud → agent: publisher node lacks e2e-v1
+  }
+
+  // Номера 10, 11, 12 занимала агент-платформа (publish_inference_point_ack,
+  // inference_request, inference_cancel). См. пояснение выше.
+  reserved 10, 11, 12;
+}
+
+message NodeHello {
+  string space_id = 1;
+  string node_id = 2;
+  string display_name = 3;
+  // HMAC-SHA256(OwnerToken, NodeId), base64. Required — cloud rejects Hello with
+  // AccessDenied("Invalid node auth token") if missing or wrong. Both sides compute
+  // independently from the shared OwnerToken (see Korat.Domain.Auth.NodeAuthTokens).
+  string node_auth_token = 4;
+  // 017: role this connection plays — "publisher" (runs korat up/service, hosts MCP
+  // servers) or "agent" (korat connect, consumes a server). Empty/absent ⇒ publisher
+  // (back-compat). Lets a machine present a distinct agent node per agent client.
+  string node_kind = 5;
+  string cli_version = 6;   // bare SemVer of the running CLI ("" for legacy CLIs)
+  // 029: capability set this node advertises. Absent/empty ⇒ legacy node, no inference.
+  // Known value: "inference" — node serves /inference/* requests via the relay.
+  // 031: adds "e2e-v1" — node supports relay-mediated ECDH key exchange + AES-256-GCM payload encryption.
+  // Additive: old CLIs omit this field and keep working unchanged.
+  repeated string capabilities = 7;
+  // Node host metadata (additive, node-visibility-doctor design 2026-07-02): CLI-collected facts
+  // about the machine this node runs on, refreshed on every Hello. Old CLIs omit these fields
+  // (proto default ""); the cloud treats empty string as "no metadata" and stores null, not "".
+  string hostname = 8; // Environment.MachineName
+  string os = 9;       // "macos" | "linux" | "windows"; "" = unknown/legacy CLI
+  string arch = 10;}
+
+message GatewayHello {
+  string gateway_id = 1;
+  string connection_id = 2;
+  string current_cli_version = 3;        // latest stable the cloud knows about ("" if unset)
+  string min_supported_cli_version = 4;  // oldest CLI the cloud still serves ("" if unset)
+  // Server-authoritative SpaceId resolved from the Bearer token (ISpaceResolver).
+  // The client must persist this as its canonical SpaceId, replacing any placeholder
+  // (e.g. the "default" seed written before first successful connect).
+  // Field 5 is additive — existing field numbers 1-4 are unchanged.
+  string resolved_space_id = 5;
+}
+
+message Heartbeat {
+  string node_id = 1;
+  int64 sent_at_unix_ms = 2;
+}
+
+message HeartbeatAck {
+  string node_id = 1;
+  int64 received_at_unix_ms = 2;
+}
+
+message PublishMcpServer {
+  string request_id = 1;
+  string node_id = 2;
+  string display_name = 3;
+  string transport = 4;
+  string command = 5;
+  repeated string args = 6;
+}
+
+// Cloud's reply to PublishMcpServer carrying the assigned mcp_server_id so a
+// multi-server node service can map display_name -> mcp_server_id and route
+// incoming session frames (stamped with mcp_server_id) to the right local server.
+// Re-publishing the same (node, display_name) is idempotent and returns the same id.
+message PublishMcpServerAck {
+  string request_id = 1;
+  string mcp_server_id = 2;
+  string display_name = 3;
+}
+
+// Takes a previously-published server offline (e.g. `korat mcp remove` while the
+// node service is running). The cloud removes it from the space catalog.
+message UnpublishMcpServer {
+  string request_id = 1;
+  string node_id = 2;
+  string mcp_server_id = 3;
+}
+
+// 021: declarative full-set reconcile. Sent ONCE per connection by the daemon after an
+// AUTHORITATIVE config load (a parsed, well-formed config — never from a failed/partial
+// read; see the transient-empty guard). The cloud makes its state match this set: upsert
+// every server here (idempotent by (node, display_name) → stable id) and SOFT-RETIRE any
+// server it currently has for this node that is ABSENT here (availability is then derived
+// from owner-node presence — a retired server whose node is offline shows Unavailable; it
+// is NOT hard-deleted, so a transient empty config can never lose a real server). The cloud
+// replies with one PublishMcpServerAck per server so the daemon rebuilds its routing map.
+// Naturally idempotent (a pure function of the set) — safe under resend after reconnect.
+message SyncMcpServers {
+  string node_id = 1;
+  repeated ServerDesc servers = 2;
+}
+
+message ServerDesc {
+  string display_name = 1;
+  string transport = 2;
+  string command = 3;
+  repeated string args = 4;
+}
+
+message RequestSession {
+  string request_id = 1;
+  string agent_client_id = 2;
+  string mcp_server_id = 3;
+}
+
+message AccessPending {
+  string request_id = 1;
+  string access_request_id = 2;
+}
+
+message AccessDenied {
+  string request_id = 1;
+  string reason = 2;
+}
+
+message SessionOpened {
+  string request_id = 1;
+  string session_id = 2;
+  string home_gateway_id = 3;
+  PayloadLimitPolicy payload_limits = 4;
+  // 031 (additive): advisory flag — cloud stamps true when the publisher node advertised
+  // the "e2e-v1" capability in its NodeHello. ADVISORY ONLY: the agent MUST NOT trust this
+  // to determine whether E2E is actually established; the handshake outcome (answer received
+  // vs E2eNotSupported/timeout) is authoritative.
+  //
+  // Deferred-fix (latency): `optional` adds EXPLICIT PRESENCE (wire-compatible — same field
+  // number/encoding; presence-aware writers also serialize `false`). This lets the agent
+  // distinguish three states:
+  //   - field absent  → old cloud, no advisory → agent keeps the normal offer/handshake path;
+  //   - present true  → publisher advertised e2e-v1 → normal offer/handshake path;
+  //   - present false → cloud explicitly advises the publisher CANNOT do E2E → under
+  //     --e2e=prefer the agent skips the offer (no ~10s wait) and goes plaintext; under
+  //     --e2e=require it fails closed immediately.
+  // SECURITY: acting on present-false is not a new downgrade vector — a malicious cloud could
+  // already force the same outcome by forging E2eNotSupported or by black-holing the offer;
+  // --e2e=require still fails closed in every case.
+  optional bool peer_supports_e2e = 5;
+}
+
+message RelayFrame {
+  string session_id = 1;
+  string source_node_id = 2;
+  string target_node_id = 3;
+  uint64 sequence_number = 4;
+  string direction = 5;
+  bytes ciphertext = 6;
+  // Stamped by the cloud ONLY on frames relayed to the publisher (serving) node, so a
+  // multi-server node service can route the session to the right local MCP server.
+  // Empty on frames toward the agent and on frames sent by nodes.
+  string mcp_server_id = 7;
+  // 031 (additive): encryption scheme indicator.
+  // 0 / absent = legacy plaintext (ciphertext field carries raw MCP bytes, unchanged).
+  // 1 = AES-256-GCM v1 (ciphertext carries tag(16)||ct; nonce is deterministic; see CRYPTO.md §2).
+  // Old peers see unknown field 8 → skip it; they still parse ciphertext as plaintext (back-compat).
+  uint32 enc = 8;
+  // 031 (additive): cleartext metadata header stamped by the sender (node or agent).
+  // AAD-bound to the ciphertext so cloud tampering causes AEAD failure at the peer.
+  // Absent on legacy frames (enc==0, meta==null) and on frames with enc!=0 but no meta.
+  FrameMetadata meta = 9;
+}
+
+// 031 (additive): cleartext metadata header for an E2E-encrypted relay frame.
+// The cloud reads ONLY these fields for inspection/policy (see McpToolCallInspector.ObserveMetadata).
+// Never contains sensitive content (tool args/results stay inside the encrypted payload).
+// Stamped by the sender (publisher node for tool results; agent for tool calls).
+// AAD-bound: its serialized bytes are included in the AEAD additional data, so a cloud that
+// alters this header causes decryption failure at the peer.
+message FrameMetadata {
+  // MCP tool name from a tools/call request, or empty for responses/notifications/chunks
+  // where the name is not re-stated (matches today's cloud inspector behaviour).
+  string tool_name  = 1;
+  // Direction of this frame: "client_to_server" (agent→publisher) | "server_to_client" (publisher→agent).
+  // Redundant with RelayFrame.direction but included in AAD so a direction-splice attack
+  // (replaying a publisher→agent frame as agent→publisher) causes AEAD failure.
+  string kind       = 2; // "request" | "response" | "notification" | "chunk"
+  string category   = 3; // "tool_call" | "tool_result" | "lifecycle" | "other"
+  uint64 payload_bytes = 4; // byte count of the plaintext payload (ct.Length - 16)
+}
+
+message CloseSession {
+  string session_id = 1;
+  string reason = 2;
+}
+
+message PayloadLimitExceeded {
+  string session_id = 1;
+  string limit_name = 2;
+  uint64 limit_bytes = 3;
+}
+
+message PayloadLimitPolicy {
+  uint64 per_message_limit_bytes = 1;
+  uint64 session_warning_bytes = 2;
+  uint64 session_hard_limit_bytes = 3;
+}
+
+// ── 029: Inference Point messages (additive) ─────────────────────────────────────────────────────
+//
+// A node announces a headless_agent point (mirrors PublishMcpServer; idempotent by
+// (node, agent_name) → stable inference_point_id). The cloud registers it in the space
+// catalog and replies with PublishInferencePointAck.
+//
+// Why dedicated messages instead of RelayFrame piggyback: RelayFrame carries per-session
+// encrypted MCP bytes keyed by session_id/mcp_server_id. Inference is a request/response job
+// keyed by correlation_id with cloud-visible structured fields (model, stream, finish_reason)
+// the cloud must read to build the HTTP/SSE response. New oneof cases are fully additive and
+// keep both planes clean. Bytes still bypass grains (data plane), consistent with 009/016.
+
+// ── 030: Push-to-wake (additive) ─────────────────────────────────────────────────────────────────
+//
+// A mobile node reports its APNs device token so the cloud can send a silent push when an agent
+// requests a session while the node is offline (backgrounded/suspended).
+//
+// Design choices:
+//   - Dedicated message (not a NodeHello field): the APNs token arrives asynchronously
+//     (didRegisterForRemoteNotificationsWithDeviceToken) — usually AFTER the stream is already
+//     connected — and can rotate mid-stream. A Hello field would miss both cases.
+//   - `platform` carries the APNs environment: debug builds get sandbox tokens
+//     (api.sandbox.push.apple.com); TestFlight/App Store get production tokens. The token
+//     itself does not encode this — the client must declare which environment to use.
+//   - Old cloud ignores unknown oneof cases (default switch falls through) so a new app
+//     talking to an old cloud degrades gracefully to foreground-only.
+//   - Idempotent upsert: sending the same token repeatedly is harmless; cloud overwrites.
+//   - APNs 410 Unregistered response clears the token via RegisterPushToken("", "").
+message RegisterPushToken {
+  // advisory: mirrors the node_id from Hello-bound stream; primary attribution comes from the stream
+  string node_id  = 1;
+  // APNs device token, lowercase hex; empty string means "clear / no longer wake-capable"
+  string token    = 2;
+  // APNs environment: "apns" (production/TestFlight) | "apns_sandbox" (debug/simulator); future: "fcm"
+  string platform = 3;
+}
+
+// ── 031: E2E key exchange (additive) ─────────────────────────────────────────────────────────────
+//
+// Per-session relay-mediated ECDH (P-256 ephemeral). The cloud relays these three messages
+// unchanged between the session participants; it NEVER sees plaintext payloads derived from
+// the handshake. Key-exchange happens after SessionOpened (agent side initiates).
+//
+// Trust model (IMPORTANT — do NOT modify without updating CRYPTO.md):
+//   PASSIVE cloud (DB dump, log scrape, full-transcript sniff): cannot derive K_payload.
+//     The cloud sees: session_id, agent_client_id, publisher_node_id, offer.pub_key,
+//     answer.pub_key, offer.salt, confirm.confirm_tag, all frame ciphertexts + metadata.
+//     With only public keys it cannot compute the ECDH shared secret; K_payload ≡ opaque.
+//   ACTIVE cloud (MITM, key-swap): CAN substitute pub_key in the offer/answer.
+//     The confirm tags (HMAC over the transcript hash that binds both keys) do NOT prevent
+//     this — a key-swapping relay can produce consistent tags on a forged transcript.
+//     This is a DOCUMENTED RESIDUAL. Upgrade path: long-term publisher identity keypair
+//     signs "answer.pub_key || transcript_hash"; agent TOFU-pins the fingerprint;
+//     owner pins via console. That rides in a later additive E2eKeyAnswer field.
+//   DOWNGRADE (cloud sends E2eNotSupported to honest agent): visible to both sides — agent
+//     emits a loud downgrade warning and, under --e2e=require, closes the session.
+//
+// Identity binding: pub keys are delivered only on the Bearer/HMAC-authenticated streams
+// of the two session participants; identities are hashed into the transcript, making
+// cross-session key-reuse attacks fail at the AEAD level.
+
+// Agent → cloud → publisher: offer to establish E2E encryption for the session.
+// The cloud forwards this to the publisher after validating sender ∈ session participants.
+message E2eKeyOffer {
+  string session_id      = 1;
+  uint32 version         = 2; // protocol version; current = 1
+  string curve           = 3; // "p256" (current); "x25519" reserved for future
+  bytes  pub_key         = 4; // agent's ephemeral public key, SPKI DER encoding
+  bytes  salt            = 5; // 16 random bytes for HKDF salt (generated by agent)
+  // Populated by the cloud before forwarding to the publisher (not set by the agent).
+  // Lets the publisher route the reply back to the correct MCP server session context.
+  string mcp_server_id   = 6;
+  // 031: agent_client_id stamped by the cloud when forwarding to the publisher.
+  // Included in the transcript hash so both sides bind the same identity context.
+  string agent_client_id = 7;
+}
+
+// Publisher → cloud → agent: respond with own ephemeral pubkey and a binding confirm tag.
+// confirm_tag = HMAC-SHA256(K_conf, "publisher-confirm" || transcript_hash)
+// The cloud validates sender ∈ session participants and forwards to the agent.
+message E2eKeyAnswer {
+  string session_id      = 1;
+  uint32 version         = 2;
+  string curve           = 3;
+  bytes  pub_key         = 4; // publisher's ephemeral public key, SPKI DER encoding
+  bytes  confirm_tag     = 5; // HMAC-SHA256(K_conf, "publisher-confirm" || transcript_hash); 32 bytes
+  // 031 MAJOR-3 (additive): publisher's node id, stamped by the cloud when forwarding the answer
+  // to the agent. Lets the aggregator derive the same transcript hash as the direct-connect path
+  // without out-of-band identity resolution. Old clouds omit this field (proto3 default "")
+  // → both sides fall back to empty string (same behaviour as before this field existed).
+  string publisher_node_id = 6;
+}
+
+// Agent → cloud → publisher: close the handshake; confirms agent derived the same session key.
+// confirm_tag = HMAC-SHA256(K_conf, "agent-confirm" || transcript_hash)
+message E2eKeyConfirm {
+  string session_id      = 1;
+  bytes  confirm_tag     = 2; // HMAC-SHA256(K_conf, "agent-confirm" || transcript_hash); 32 bytes
+}
+
+// Cloud → agent: publisher node does not support e2e-v1. The agent MUST surface a downgrade
+// warning (stderr); under --e2e=require it MUST close the session instead of continuing.
+message E2eNotSupported {
+  string session_id = 1;
+  string reason     = 2; // human-readable; e.g. "publisher does not support e2e-v1"
+}

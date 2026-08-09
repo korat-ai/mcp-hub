@@ -1,0 +1,9 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>Korat.Demo.EchoMcp</RootNamespace>
+    <AssemblyName>Korat.Demo.EchoMcp</AssemblyName>
+  </PropertyGroup>
+
+</Project>

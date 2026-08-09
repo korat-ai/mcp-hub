@@ -1,0 +1,79 @@
+<Project>
+  <PropertyGroup>
+    <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- gRPC / Protobuf -->
+    <PackageVersion Include="Google.Protobuf" Version="3.29.3" />
+    <PackageVersion Include="Grpc.AspNetCore" Version="2.67.0" />
+    <PackageVersion Include="Grpc.Net.Client" Version="2.67.0" />
+    <PackageVersion Include="Grpc.Tools" Version="2.69.0" />
+
+    <!-- Entity Framework Core -->
+    <PackageVersion Include="Microsoft.EntityFrameworkCore" Version="10.0.7" />
+    <PackageVersion Include="Microsoft.EntityFrameworkCore.Design" Version="10.0.7" />
+    <PackageVersion Include="Microsoft.EntityFrameworkCore.InMemory" Version="10.0.7" />
+    <PackageVersion Include="Microsoft.EntityFrameworkCore.Relational" Version="10.0.7" />
+    <PackageVersion Include="Npgsql.EntityFrameworkCore.PostgreSQL" Version="10.0.2" />
+    <PackageVersion Include="Npgsql" Version="10.0.3" />
+
+    <!-- ASP.NET Core -->
+    <PackageVersion Include="Microsoft.AspNetCore.Authentication.Google" Version="10.0.0" />
+    <PackageVersion Include="Microsoft.AspNetCore.DataProtection.EntityFrameworkCore" Version="10.0.7" />
+    <PackageVersion Include="Microsoft.AspNetCore.Mvc.Testing" Version="10.0.0" />
+    <PackageVersion Include="Microsoft.AspNetCore.OpenApi" Version="10.0.0" />
+
+    <!-- Orleans -->
+    <PackageVersion Include="Microsoft.Orleans.Clustering.AdoNet" Version="10.2.1" />
+    <PackageVersion Include="Microsoft.Orleans.Persistence.AdoNet" Version="10.2.1" />
+    <PackageVersion Include="Microsoft.Orleans.Sdk" Version="10.2.1" />
+    <PackageVersion Include="Microsoft.Orleans.Serialization.SystemTextJson" Version="10.2.1" />
+    <PackageVersion Include="Microsoft.Orleans.Server" Version="10.2.1" />
+    <PackageVersion Include="Microsoft.Orleans.TestingHost" Version="10.2.1" />
+
+    <!-- OpenIddict -->
+    <PackageVersion Include="OpenIddict.AspNetCore" Version="7.5.0" />
+    <PackageVersion Include="OpenIddict.EntityFrameworkCore" Version="7.5.0" />
+    <PackageVersion Include="OpenIddict.Validation.ServerIntegration" Version="7.5.0" />
+    <!-- Проверка токенов провайдера входа по его JWKS. Версия совпадает с той, что уже
+         приходит транзитивно с OpenIddict: расхождение внутри одного семейства
+         Microsoft.IdentityModel даёт конфликты типов там, где их не ждёшь. -->
+    <PackageVersion Include="Microsoft.IdentityModel.Protocols.OpenIdConnect" Version="8.16.0" />
+    <!-- Браузерный вход хаба через провайдер входа Korat. Версия из семейства ASP.NET Core,
+         а не Microsoft.IdentityModel: пакет ставит обработчик схемы, а не разбор токенов. -->
+    <PackageVersion Include="Microsoft.AspNetCore.Authentication.OpenIdConnect" Version="10.0.7" />
+
+    <!-- OpenTelemetry -->
+    <PackageVersion Include="OpenTelemetry.Exporter.OpenTelemetryProtocol" Version="1.15.3" />
+    <PackageVersion Include="OpenTelemetry.Extensions.Hosting" Version="1.15.3" />
+
+    <!-- NATS -->
+    <PackageVersion Include="NATS.Net" Version="2.8.1" />
+    <PackageVersion Include="NATS.NKeys" Version="1.0.1" />
+
+    <!-- Sentry -->
+    <PackageVersion Include="Sentry" Version="6.6.0" />
+    <PackageVersion Include="Sentry.AspNetCore" Version="6.6.0" />
+
+    <!-- CLI -->
+    <PackageVersion Include="System.CommandLine" Version="2.0.0-beta4.22272.1" />
+
+    <!-- Firebase (031 mobile-push increment 2: FCM alert sender for Android) -->
+    <PackageVersion Include="FirebaseAdmin" Version="3.6.0" />
+
+    <!-- Testing -->
+    <!-- Покрытие: coverlet.collector работает через флаг `collect` команды
+         `dotnet test`, не требуя правок в раннере. -->
+    <PackageVersion Include="coverlet.collector" Version="6.0.2" />
+    <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="17.12.0" />
+    <PackageVersion Include="Testcontainers" Version="4.12.0" />
+    <PackageVersion Include="Testcontainers.Nats" Version="4.12.0" />
+    <PackageVersion Include="Testcontainers.PostgreSql" Version="4.12.0" />
+    <PackageVersion Include="xunit" Version="2.9.3" />
+    <PackageVersion Include="xunit.runner.visualstudio" Version="2.8.2" />
+    <PackageVersion Include="Xunit.SkippableFact" Version="1.5.61" />
+    <!-- #178 cloud MAF agents on AG-UI. NOTE: the AG-UI hosting package is PREVIEW-only. -->
+    <PackageVersion Include="Microsoft.Agents.AI" Version="1.13.0" />
+  </ItemGroup>
+</Project>

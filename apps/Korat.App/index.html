@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en" class="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="icon" type="image/svg+xml" href="/app/favicon.svg" />
+    <meta name="color-scheme" content="dark light" />
+    <title>Korat</title>
+    <script>
+      // Apply persisted theme before React mounts to avoid a flash of light theme.
+      try {
+        const t = localStorage.getItem('korat:theme');
+        if (t === 'light') document.documentElement.classList.remove('dark');
+      } catch (_) {}
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

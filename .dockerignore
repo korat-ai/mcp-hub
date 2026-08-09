@@ -1,0 +1,48 @@
+# Build artifacts
+**/bin/
+**/obj/
+**/TestResults/
+artifacts/
+dist/
+
+# IDE / editor
+**/.vs/
+**/.idea/
+**/.vscode/
+**/.cursor/
+**/*.user
+**/*.suo
+**/*.rsuser
+.DS_Store
+
+# Source control + CI
+.git/
+.github/
+.gitignore
+
+# Don't ship local npm-build output into Docker build context — Dockerfile rebuilds
+# the SPA from source inside the build stage. Including the local output can:
+#   - poison the build with stale hashes from a previous local build
+#   - skip the in-Docker Vite rebuild via MSBuild Inputs/Outputs UpToDateCheck
+apps/Korat.Cloud/wwwroot/app/
+
+# Non-deployable apps (only Korat.Cloud ships)
+apps/Korat.Cli/
+apps/Korat.Demo.EchoMcp/
+apps/Korat.Node/
+
+# Tests + specs + docs
+tests/
+specs/
+docs/
+scripts/
+.specify/
+.agents/
+
+# Docker-compose for local dev
+docker-compose.yml
+
+# Local secrets
+.env
+.env.*
+!.env.example
