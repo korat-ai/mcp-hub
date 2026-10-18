@@ -49,8 +49,11 @@ public sealed class FreshBearerHandler : DelegatingHandler
             var loaded = await _store.LoadAsync(cancellationToken);
             current = loaded is not null && IsCompatible(loaded) ? loaded : _fallback;
         }
-        catch (Exception exception) when (exception is not OperationCanceledException)
+        catch (Exception exception) when (
+            exception is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
         {
+            // Таймаут провайдера тоже приходит как отмена, но не отменяет запрос к хабу.
+            // Только отмена переданного сюда токена должна остановить этот запрос.
             current = _fallback;
         }
 

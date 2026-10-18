@@ -140,6 +140,45 @@ public sealed class FreshBearerHandlerTests : IDisposable
         Assert.Equal(["Bearer fallback"], seen);
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Refresh_timeout_uses_the_valid_fallback_when_the_request_was_not_cancelled(
+        bool taskCancellation)
+    {
+        var refreshCalls = 0;
+        bool? cancelledDuringRefresh = null;
+        var store = new CredentialStore(
+            _directory,
+            (_, ct) =>
+            {
+                refreshCalls++;
+                cancelledDuringRefresh = ct.IsCancellationRequested;
+                // HttpClient timeouts are cancellations too, but of the provider request,
+                // not necessarily of the caller's request to the hub.
+                OperationCanceledException timeout = taskCancellation
+                    ? new TaskCanceledException("Provider timed out", new TimeoutException())
+                    : new OperationCanceledException("Provider timed out", new TimeoutException());
+                return Task.FromException<CliCredentials?>(timeout);
+            });
+        // Refresh starts 60 seconds before expiry, while this credential still works.
+        var fallback = Sample("still-valid") with { ExpiresAt = DateTimeOffset.UtcNow.AddSeconds(45) };
+        await store.SaveAsync(fallback, CancellationToken.None);
+
+        var seen = new List<string?>();
+        using var http = CreateClient(store, fallback, seen);
+        using var cts = new CancellationTokenSource();
+
+        using var response = await http.GetAsync("space", cts.Token);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Equal(1, refreshCalls);
+        Assert.False(cancelledDuringRefresh);
+        Assert.False(cts.IsCancellationRequested);
+        Assert.True(fallback.ExpiresAt > DateTimeOffset.UtcNow);
+        Assert.Equal(["Bearer still-valid"], seen);
+    }
+
     [Fact]
     public async Task Cancellation_during_store_refresh_is_not_swallowed_or_forwarded()
     {
