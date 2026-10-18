@@ -26,6 +26,16 @@ public static class PendingLinkEndpoints
             var link = pending.TryRead(raw);
             if (link is null) return Results.BadRequest(new { error = "expired" });
 
+            var userIsActive = await db.Users.AnyAsync(
+                u => u.Id == link.ExistingUserId && u.Status == UserStatus.Active, ct);
+            if (!userIsActive)
+            {
+                logger.LogWarning(
+                    "Pending cross-IdP link rejected for inactive or missing user {UserId}",
+                    link.ExistingUserId);
+                return Results.BadRequest(new { error = "expired" });
+            }
+
             // Idempotency: if the user double-clicks Confirm (or the pending cookie is
             // replayed within its TTL), we'd otherwise add duplicate ExternalLogin rows
             // (which then fail the unique (Provider, ProviderUserId) index from Task 3).

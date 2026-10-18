@@ -26,11 +26,27 @@ public sealed class SessionBumpTests
         return (svc, db);
     }
 
+    private static async Task<UserId> SeedUserAsync(KoratDbContext db)
+    {
+        var userId = UserId.New();
+        db.Users.Add(new User
+        {
+            Id = userId,
+            PrimaryEmail = $"session-bump-{userId.Value:N}@example.com",
+            DisplayName = "Session Bump User",
+            CreatedAt = DateTimeOffset.UtcNow,
+            Status = UserStatus.Active,
+            IsAdmin = false,
+        });
+        await db.SaveChangesAsync();
+        return userId;
+    }
+
     [Fact]
     public async Task ValidateAndBump_Succeeds_OnValidSession()
     {
-        var (svc, _) = Build();
-        var userId = UserId.New();
+        var (svc, db) = Build();
+        var userId = await SeedUserAsync(db);
         var session = await svc.CreateAsync(userId, "TestUA", "10.0.0.1", default);
 
         var result = await svc.ValidateAndBumpAsync(session.Id, default);
@@ -43,8 +59,8 @@ public sealed class SessionBumpTests
     [Fact]
     public async Task ValidateAndBump_ReturnsNull_AfterRevoke()
     {
-        var (svc, _) = Build();
-        var session = await svc.CreateAsync(UserId.New(), null, null, default);
+        var (svc, db) = Build();
+        var session = await svc.CreateAsync(await SeedUserAsync(db), null, null, default);
         await svc.RevokeAsync(session.Id, default);
 
         var result = await svc.ValidateAndBumpAsync(session.Id, default);

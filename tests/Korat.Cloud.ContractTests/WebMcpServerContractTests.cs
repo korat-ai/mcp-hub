@@ -418,6 +418,7 @@ public sealed class WebMcpServerContractTests(KoratIntegrationFixture fixture) :
 
         var client = factory.CreateClient();
         client.DefaultRequestHeaders.Add("Cookie", $"{CanonicalSigninHandler.SessionCookieName}={session.Id:N}");
+        fixture.AttachAntiforgeryTokens(client, factory);
         return client;
     }
 }

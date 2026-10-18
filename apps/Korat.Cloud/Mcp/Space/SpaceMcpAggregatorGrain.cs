@@ -739,7 +739,7 @@ public sealed partial class SpaceMcpAggregatorGrain(
         foreach (var serverId in _subscriptions.Keys.Select(k => k.ServerId).Distinct().ToArray())
             if (!grantedServerIds.Contains(serverId)) RemoveContent(serverId);
 
-        await RefreshDirtyCatalogsAsync(ct);
+        StartDirtyCatalogRefreshes(ct);
         foreach (var backend in _backendsBySlug.Values.ToArray()) StartRestoreSubscriptions(backend);
 
         // (c) Ungranted-stub set changed — refresh the request-access catalog entries. Diffed
@@ -813,7 +813,9 @@ public sealed partial class SpaceMcpAggregatorGrain(
                 if (msg.Params?["cursor"] is not null)
                     return JsonRpcMessage.Error(msg.Id, -32602, "This catalog has no continuation cursor.");
                 await PruneUnauthorizedContentAsync();
-                await RefreshDirtyCatalogsAsync(CancellationToken.None);
+                // Serve the last authorized snapshot while each source refreshes separately.
+                // Source latency must not become latency for every aggregate list request.
+                StartDirtyCatalogRefreshes(CancellationToken.None);
             }
 
             return msg.Method switch

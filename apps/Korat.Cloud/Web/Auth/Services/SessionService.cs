@@ -80,7 +80,8 @@ public sealed class SessionService(
                 s.Id == sessionId
                 && s.RevokedAt == null
                 && s.ExpiresAt > now
-                && s.AbsoluteExpiresAt > now, ct);
+                && s.AbsoluteExpiresAt > now
+                && db.Users.Any(u => u.Id == s.UserId && u.Status == UserStatus.Active), ct);
             if (session is null) return null;
             var newExpiresAt = slidingTarget < session.AbsoluteExpiresAt ? slidingTarget : session.AbsoluteExpiresAt;
             var updated = session with { LastUsedAt = now, ExpiresAt = newExpiresAt };
@@ -92,13 +93,19 @@ public sealed class SessionService(
         // Single atomic SQL: validates + bumps + returns identity in one round trip.
         // LEAST() enforces the absolute cap independent of activity.
         var rows = await db.Database.SqlQuery<SessionBumpRow>($@"
-            UPDATE ""AuthSession""
+            UPDATE ""AuthSession"" AS s
                SET ""LastUsedAt"" = {now},
                    ""ExpiresAt""  = LEAST({slidingTarget}, ""AbsoluteExpiresAt"")
-             WHERE ""Id""                  = {sessionId}
-               AND ""RevokedAt""           IS NULL
-               AND ""ExpiresAt""           > {now}
-               AND ""AbsoluteExpiresAt""   > {now}
+             WHERE s.""Id""                  = {sessionId}
+               AND s.""RevokedAt""           IS NULL
+               AND s.""ExpiresAt""           > {now}
+               AND s.""AbsoluteExpiresAt""   > {now}
+               AND EXISTS (
+                   SELECT 1
+                     FROM ""User"" AS u
+                    WHERE u.""Id"" = s.""UserId""
+                      AND u.""Status"" = {UserStatus.Active.ToString()}
+               )
             RETURNING ""UserId"" AS ""UserIdValue"", ""ExpiresAt""
         ").ToListAsync(ct);
 

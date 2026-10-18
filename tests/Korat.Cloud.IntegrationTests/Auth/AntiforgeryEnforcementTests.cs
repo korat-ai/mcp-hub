@@ -39,7 +39,7 @@ public sealed class AntiforgeryEnforcementTests(KoratIntegrationFixture fixture)
         // Endpoint is full-scope gated, so the request must be authenticated to reach the
         // antiforgery filter (unauthenticated → 401). Cookie present, no XSRF token → 400.
         var seeded = await fixture.SeedUserAsync($"sessrevoke-noxsrf-{Guid.NewGuid():N}@test.local", "Name");
-        using var client = await fixture.CreateAuthenticatedClientAsync(seeded.UserId);
+        using var client = await fixture.CreateCookieAuthenticatedClientAsync(seeded.UserId);
         var id = Guid.NewGuid();
         var response = await client.PostAsync($"/api/auth/sessions/{id}/revoke", null);
 

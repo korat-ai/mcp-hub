@@ -57,8 +57,33 @@ public sealed class MagicLinkService(
         await db.SaveChangesAsync(ct);
 
         var consumeUrl = new Uri(appBaseUri, $"/signin/magic-link/consume?token={rawToken}");
-        await emailSender.SendMagicLinkAsync(normalised, consumeUrl, TokenTtl, ct);
+        try
+        {
+            await emailSender.SendMagicLinkAsync(normalised, consumeUrl, TokenTtl, ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            await RemoveFailedTokenAsync(token);
+            throw;
+        }
+        catch (Exception ex)
+        {
+            await RemoveFailedTokenAsync(token);
+            logger.LogError(ex,
+                "MagicLink delivery failed; failed token removed for email-hash {Hash}",
+                HashEmailForLog(normalised));
+            return; // preserve the endpoint's anti-enumerating 204 response
+        }
         logger.LogInformation("MagicLink issued for email-hash {Hash}", HashEmailForLog(normalised));
+    }
+
+    private async Task RemoveFailedTokenAsync(MagicLinkToken token)
+    {
+        // The request token may already be cancelled. Cleanup is deliberately limited to the
+        // just-created row and uses an independent token so a failed delivery cannot leave the
+        // one-hour per-email cooldown active.
+        db.MagicLinkTokens.Remove(token);
+        await db.SaveChangesAsync(CancellationToken.None);
     }
 
     public async Task<MagicLinkConsumeResult?> TryConsumeAsync(string rawToken, string? ip, string? uaHash, CancellationToken ct)

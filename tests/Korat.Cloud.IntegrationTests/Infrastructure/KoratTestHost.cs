@@ -149,8 +149,8 @@ public sealed class KoratIntegrationFixture : IAsyncLifetime
     /// SpaceResolver returns SpaceId("default") for those requests — preserving
     /// the historical behaviour for tests that authenticate as that user via session.
     ///
-    /// This bridge row is intentionally NOT created through IUserProvisioningService
-    /// because the dev owner is a synthetic sentinel, not a real provisioned user.
+    /// The synthetic owner has an active User row too: sessions must not authenticate a
+    /// missing or suspended user. Seeding directly preserves this fixture's stable IDs.
     /// </summary>
     private async Task SeedLegacyOwnerSpaceAsync()
     {
@@ -159,6 +159,18 @@ public sealed class KoratIntegrationFixture : IAsyncLifetime
         var now = DateTimeOffset.UtcNow;
         using var scope = Factory.Services.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<KoratDbContext>();
+        if (!await db.Users.AnyAsync(u => u.Id == DevSpaceOwnerUserId))
+        {
+            db.Users.Add(new Korat.Domain.Auth.User
+            {
+                Id = DevSpaceOwnerUserId,
+                PrimaryEmail = "legacy-fixture@example.test",
+                DisplayName = "Legacy Dev Owner",
+                CreatedAt = now,
+                Status = Korat.Domain.Auth.UserStatus.Active,
+                IsAdmin = false,
+            });
+        }
         // Idempotent — if already seeded (e.g. RecycleSilosAsync), skip.
         if (!await db.Spaces.AnyAsync(s => s.OwnerUserId == legacyOwnerUserIdN && s.IsDefault))
         {
@@ -171,8 +183,8 @@ public sealed class KoratIntegrationFixture : IAsyncLifetime
                 CreatedAt = now,
                 UpdatedAt = now,
             });
-            await db.SaveChangesAsync();
         }
+        await db.SaveChangesAsync();
     }
 
     public async Task RecycleSilosAsync()
@@ -294,11 +306,15 @@ public sealed class KoratIntegrationFixture : IAsyncLifetime
     }
 
     /// <summary>
-    /// Mints a valid session for the given user via the SP1 SessionService and returns
-    /// an HttpClient with the __Host-korat_session cookie pre-set so every request is
-    /// authenticated as that user.
+    /// Returns a browser client with a session and matched CSRF tokens. Use
+    /// <see cref="CreateCookieAuthenticatedClientAsync"/> to test missing-CSRF rejection.
     /// </summary>
-    public async Task<HttpClient> CreateAuthenticatedClientAsync(
+    public Task<HttpClient> CreateAuthenticatedClientAsync(
+        UserId userId, WebApplicationFactory<Program>? factory = null) =>
+        CreateAuthenticatedClientWithAntiforgeryAsync(userId, factory);
+
+    /// <summary>Returns a session-cookie-only client, deliberately without CSRF tokens.</summary>
+    public async Task<HttpClient> CreateCookieAuthenticatedClientAsync(
         UserId userId, WebApplicationFactory<Program>? factory = null)
     {
         // `factory` lets a caller point the client at a WithWebHostBuilder-derived host (e.g. one
@@ -336,8 +352,15 @@ public sealed class KoratIntegrationFixture : IAsyncLifetime
         UserId userId, WebApplicationFactory<Program>? factory = null)
     {
         factory ??= Factory;
-        var client = await CreateAuthenticatedClientAsync(userId, factory);
+        var client = await CreateCookieAuthenticatedClientAsync(userId, factory);
+        AttachAntiforgeryTokens(client, factory);
+        return client;
+    }
 
+    /// <summary>Adds a real matched CSRF pair to an existing browser client.</summary>
+    public void AttachAntiforgeryTokens(HttpClient client, WebApplicationFactory<Program>? factory = null)
+    {
+        factory ??= Factory;
         using var scope = factory.Services.CreateScope();
         var antiforgery = scope.ServiceProvider.GetRequiredService<IAntiforgery>();
 
@@ -367,8 +390,6 @@ public sealed class KoratIntegrationFixture : IAsyncLifetime
             client.DefaultRequestHeaders.Add("Cookie", $"__Secure-korat_xsrf={cookieToken}");
         if (tokens.RequestToken is not null)
             client.DefaultRequestHeaders.Add("X-XSRF-TOKEN", tokens.RequestToken);
-
-        return client;
     }
 
     /// <summary>

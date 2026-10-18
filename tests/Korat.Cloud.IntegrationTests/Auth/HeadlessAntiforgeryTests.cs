@@ -65,7 +65,7 @@ public sealed class HeadlessAntiforgeryTests(KoratIntegrationFixture fixture)
         var seeded = await fixture.SeedUserAsync(
             $"cookie-admin-{Guid.NewGuid():N}@test.local", "Cookie Admin");
         await fixture.MakeAdminAsync(seeded.UserId);
-        using var client = await fixture.CreateAuthenticatedClientAsync(seeded.UserId); // cookie, NO xsrf
+        using var client = await fixture.CreateCookieAuthenticatedClientAsync(seeded.UserId); // cookie, NO xsrf
 
         var resp = await client.PostAsync(AdminMutation, content: null);
 

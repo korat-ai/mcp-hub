@@ -12,7 +12,8 @@ public static class RequireAntiforgeryExtensions
     ///
     /// Use this on JSON minimal-API POSTs that are not form-bound: <c>UseAntiforgery()</c>
     /// middleware only auto-validates form-encoded endpoints. SPA JSON POSTs rely on
-    /// <c>SameSite=Lax</c> alone without this filter.
+    /// <c>SameSite=Lax</c> alone without this filter, which does not stop same-site,
+    /// cross-origin requests from sibling domains.
     ///
     /// Mirrors the explicit <c>ValidateRequestAsync</c> call previously in
     /// <c>MagicLinkEndpoints</c> — single source of truth for the pattern.
@@ -30,7 +31,7 @@ public static class RequireAntiforgeryExtensions
 
     /// <summary>
     /// Like <see cref="RequireAntiforgeryValidation{TBuilder}"/> but skips antiforgery
-    /// entirely when the session cookie (<c>__Host-korat_session</c>) is absent.
+    /// for safe methods or when the session cookie (<c>__Host-korat_session</c>) is absent.
     ///
     /// <para>
     /// A request without the session cookie cannot be authenticated via cookie
@@ -46,9 +47,9 @@ public static class RequireAntiforgeryExtensions
     /// </para>
     ///
     /// <para>
-    /// Safe because the session cookie is <c>SameSite=Lax</c>: a cookie-bearing request can
-    /// never be a cross-site POST, so an attacker cannot simultaneously send the cookie (to
-    /// authenticate as the victim) and omit it (to trigger the antiforgery skip).
+    /// Cookie presence is checked even when an Authorization header is also supplied: adding
+    /// a bearer token must not bypass protection for the ambient cookie identity.
+    /// SameSite alone is insufficient because sibling origins can still send that cookie.
     /// </para>
     /// </summary>
     public static TBuilder RequireAntiforgeryUnlessHeadless<TBuilder>(this TBuilder builder)
@@ -58,15 +59,12 @@ public static class RequireAntiforgeryExtensions
         {
             endpointBuilder.FilterFactories.Add((_, next) => async ctx =>
             {
-                // No session cookie ⇒ the request cannot be cookie-authenticated
-                // (PolymorphicAuthResolver: cookie wins first, bearer second). It is either
-                // a non-ambient bearer caller (CLI; Authorization is never auto-attached
-                // cross-site ⇒ not forgeable) or anonymous (rejected by the endpoint's
-                // IsAdmin gate). Either way there is no CSRF surface, so skip validation.
-                // When the cookie IS present, fall through to full antiforgery enforcement —
-                // identical to RequireAntiforgeryValidation. Safe because the session cookie
-                // is SameSite=Lax: a cookie-bearing request can never be a cross-site POST.
-                if (!ctx.HttpContext.Request.Cookies.ContainsKey(CanonicalSigninHandler.SessionCookieName))
+                var request = ctx.HttpContext.Request;
+                // Reads need no token. Mutations without an ambient session cookie are
+                // either headless bearer calls or anonymous calls rejected by the auth gate.
+                if (HttpMethods.IsGet(request.Method) || HttpMethods.IsHead(request.Method)
+                    || HttpMethods.IsOptions(request.Method) || HttpMethods.IsTrace(request.Method)
+                    || !request.Cookies.ContainsKey(CanonicalSigninHandler.SessionCookieName))
                     return await next(ctx);
                 return await ValidateOrFailAsync(ctx, next);
             });

@@ -16,9 +16,10 @@ public sealed class ResendEmailSender(
         var opts = options.Value;
         if (string.IsNullOrEmpty(opts.ApiKey))
         {
-            // Dev convenience: log the link instead of failing the signin flow when Resend is unconfigured.
-            logger.LogWarning("Resend API key missing — magic-link not sent. URL would have been: {Url}", consumeUrl);
-            return;
+            // Propagate the failed delivery to MagicLinkService so it can remove the token row.
+            // Never include consumeUrl: it contains the raw sign-in token.
+            logger.LogError("Resend API key missing — magic-link not sent");
+            throw new InvalidOperationException("Resend API key is not configured.");
         }
 
         var html = BuildHtml(consumeUrl, ttl);
@@ -40,9 +41,10 @@ public sealed class ResendEmailSender(
         using var response = await http.SendAsync(request, ct);
         if (!response.IsSuccessStatusCode)
         {
-            var body = await response.Content.ReadAsStringAsync(ct);
-            logger.LogError("Resend send failed: {Status} {Body}", (int)response.StatusCode, body);
-            // Do NOT throw — we returned 204 to the user already (anti-enumeration). Log and move on.
+            // A provider error body is untrusted and may echo the request, including the raw
+            // consume URL. Status is sufficient for diagnostics and safe to log.
+            logger.LogError("Resend send failed with HTTP status {Status}", (int)response.StatusCode);
+            response.EnsureSuccessStatusCode();
         }
     }
 

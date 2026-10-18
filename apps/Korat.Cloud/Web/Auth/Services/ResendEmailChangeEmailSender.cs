@@ -110,8 +110,10 @@ public sealed class ResendEmailChangeEmailSender(
         using var response = await http.SendAsync(request, ct);
         if (!response.IsSuccessStatusCode)
         {
-            var body = await response.Content.ReadAsStringAsync(ct);
-            logger.LogError("Resend send failed for email-change: {Status} {Body}", (int)response.StatusCode, body);
+            // The provider body is untrusted and may echo the request, including a raw
+            // verification URL. Status is sufficient for safe diagnostics.
+            logger.LogError("Resend send failed for email-change with HTTP status {Status}", (int)response.StatusCode);
+            response.EnsureSuccessStatusCode();
         }
     }
 }

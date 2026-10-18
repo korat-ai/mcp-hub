@@ -117,23 +117,45 @@ public sealed class EmailChangeService(
         await db.SaveChangesAsync(ct);
 
         // 6. Send magic-link to the NEW address (ownership proof step).
-        // The verify link is built from appBaseUri. appBaseUri is supplied by the
-        // endpoint from Request.Scheme + Request.Host. In production, the host is
-        // fixed by the TrustForwardedIp + Fly edge proxy configuration (Program.cs
-        // §SEC-H1/L1) which rewrites Host from X-Forwarded-Host; this is the same
-        // defensive posture used throughout the application. There is no separate
-        // configured canonical-origin setting in this deployment — if one is added
-        // in future it should be wired here instead of Request.Host.
+        // The endpoint prefers configured Korat:Cli:PublicOrigin for appBaseUri, falling
+        // back to Request.Scheme + Request.Host. Trusted-proxy middleware restores the
+        // scheme; it deliberately does not accept X-Forwarded-Host. The ingress must
+        // preserve the public Host, and AllowedHosts should restrict accepted host names.
         //
         // /app prefix is required: the SPA router basepath is /app (router.ts), vite
         // base is /app/ (vite.config.ts), and the server catch-all is MapFallback("/app/{*path}").
         // A bare /account/* path has no server route and returns 404.
         var verifyUrl = new Uri(appBaseUri, $"/app/account/verify-email?token={rawToken}");
 
-        // If the mail send fails, the token row exists in the DB (counting toward the
-        // rate-limit window) but the user has no link. Rethrow so the caller (endpoint)
-        // returns a 5xx and the user can retry — a 202 with no link delivered is confusing.
-        await emailSender.SendVerificationLinkAsync(normalised, verifyUrl, TokenTtl, ct);
+        // A failed/cancelled delivery must not leave a usable token or consume one of the
+        // user's rate-limit slots. Remove only the token created by this attempt; prior
+        // superseded rows remain unchanged for issuance-event accounting. Cleanup does not
+        // use the request token because it may already be cancelled. The original delivery
+        // exception is then propagated so the caller cannot report a successful request.
+        try
+        {
+            await emailSender.SendVerificationLinkAsync(normalised, verifyUrl, TokenTtl, ct);
+        }
+        catch (Exception deliveryException)
+        {
+            db.EmailChangeTokens.Remove(token);
+            try
+            {
+                await db.SaveChangesAsync(CancellationToken.None);
+            }
+            catch (Exception cleanupException)
+            {
+                logger.LogError(cleanupException,
+                    "EmailChange failed to remove undelivered token {TokenId} for user {UserId}",
+                    token.Id, userId.Value);
+                throw new AggregateException(
+                    "Email-change delivery failed and the undelivered token could not be removed.",
+                    deliveryException,
+                    cleanupException);
+            }
+
+            throw;
+        }
 
         logger.LogInformation("EmailChange token issued for user {UserId} → {EmailHash}",
             userId.Value, HashForLog(normalised));
@@ -194,18 +216,11 @@ public sealed class EmailChangeService(
         var oldEmail = user.PrimaryEmail;
         var newEmail = token.NewEmail;
 
-        // Promote the new email in the database.
-        // Production path: atomic parameterised UPDATE via ExecuteUpdateAsync (Postgres).
-        // Test/InMemory path: change-tracking fallback (EF Core InMemory does not support
-        // ExecuteUpdateAsync). Sequential test execution (DisableTestParallelization) keeps
-        // InMemory safe; production Postgres unique index is the real concurrency arbiter.
-        //
-        // TOCTOU race: two concurrent ConfirmAsync calls for the same user (different tokens)
-        // could both pass the advisory uniqueness check in RequestAsync and both reach here.
-        // The second concurrent UPDATE will throw a DbUpdateException wrapping a Postgres
-        // unique-constraint violation (SqlState 23505). We catch it and return ExpiredOrInvalid
-        // so the user gets a graceful error rather than an unhandled 500. Data integrity is safe
-        // because the DB unique index on User.PrimaryEmail is the real arbiter.
+        // The earlier reads are advisory. In PostgreSQL, claim the still-valid token and
+        // update the email in ONE transaction: a cancellation/failure must persist neither
+        // change, and concurrent consumers must not both succeed. The user-email predicate
+        // also prevents a stale confirmation from overwriting a concurrent address change.
+        // InMemory lacks ExecuteUpdate/transactions and retains the sequential test fallback.
         var providerName = db.Database.ProviderName;
         try
         {
@@ -214,30 +229,53 @@ public sealed class EmailChangeService(
                 var tracked = await db.Users.SingleAsync(u => u.Id == userId, ct);
                 var updated = tracked with { PrimaryEmail = newEmail };
                 db.Entry(tracked).CurrentValues.SetValues(updated);
+                db.Entry(token).CurrentValues.SetValues(token with { ConsumedAt = now });
+                await db.SaveChangesAsync(ct);
             }
             else
             {
+                await using var transaction = await db.Database.BeginTransactionAsync(ct);
+
+                var consumed = await db.EmailChangeTokens
+                    .Where(t => t.Id == token.Id && t.UserId == userId && t.TokenHash == tokenHash
+                        && t.ConsumedAt == null && t.SupersededAt == null && t.ExpiresAt > now)
+                    .ExecuteUpdateAsync(s => s.SetProperty(t => t.ConsumedAt, now), ct);
+                if (consumed != 1)
+                    return new EmailChangeConfirmResult(EmailChangeConfirmStatus.ExpiredOrInvalid);
+
                 var affected = await db.Users
-                    .Where(u => u.Id == userId)
+                    .Where(u => u.Id == userId && u.PrimaryEmail == oldEmail)
                     .ExecuteUpdateAsync(s => s.SetProperty(u => u.PrimaryEmail, newEmail), ct);
 
-                if (affected == 0)
+                if (affected != 1)
                 {
-                    logger.LogError("EmailChange confirm: UPDATE affected 0 rows for user {UserId}", userId.Value);
+                    logger.LogInformation("EmailChange confirm: user {UserId} changed or disappeared before UPDATE", userId.Value);
+                    // Disposing the uncommitted transaction also undoes the token claim.
                     return new EmailChangeConfirmResult(EmailChangeConfirmStatus.ExpiredOrInvalid);
                 }
+
+                await transaction.CommitAsync(ct);
+
+                // Bulk updates bypass EF tracking. Align only the committed properties so
+                // context reuse cannot replay a stale token or flush an old email value;
+                // do not accept/discard unrelated pending changes on these entities.
+                var emailProperty = db.Entry(user).Property(u => u.PrimaryEmail);
+                emailProperty.CurrentValue = newEmail;
+                emailProperty.OriginalValue = newEmail;
+                emailProperty.IsModified = false;
+                var consumedProperty = db.Entry(token).Property(t => t.ConsumedAt);
+                consumedProperty.CurrentValue = now;
+                consumedProperty.OriginalValue = now;
+                consumedProperty.IsModified = false;
             }
-
-            // Mark the token consumed (single-use).
-            db.Entry(token).CurrentValues.SetValues(token with { ConsumedAt = now });
-
-            await db.SaveChangesAsync(ct);
         }
-        catch (DbUpdateException ex) when (
-            ex.InnerException is PostgresException pg && pg.SqlState == "23505")
+        catch (Exception ex) when (
+            ex is PostgresException { SqlState: PostgresErrorCodes.UniqueViolation }
+            || ex is DbUpdateException { InnerException: PostgresException { SqlState: PostgresErrorCodes.UniqueViolation } })
         {
-            // Unique constraint violation on User.PrimaryEmail — concurrent confirm race.
-            // Return ExpiredOrInvalid so the second request gets a graceful 410 response.
+            // ExecuteUpdate throws the provider exception directly, unlike SaveChanges.
+            // The transaction is already disposed/rolled back, including the token claim.
+            // Return ExpiredOrInvalid so a concurrently taken email gets a graceful 410.
             logger.LogInformation(
                 "EmailChange confirm: unique-constraint violation for user {UserId} — concurrent confirm race",
                 userId.Value);

@@ -52,9 +52,10 @@ public interface IEmailChangeService
     /// <see cref="EmailChangeRequestStatus.RateLimited"/> if the user has exceeded the per-hour request cap.
     /// </returns>
     /// <exception cref="Exception">
-    /// Propagates any exception thrown by the email sender (transient mail failure). The token
-    /// row is persisted but the link was not delivered; callers should return a retryable error
-    /// rather than 202-success so the user knows to try again.
+    /// Propagates any exception thrown by the email sender after removing the newly issued,
+    /// undelivered token. Prior superseded rows remain for rate-limit accounting. Callers
+    /// should return a retryable error rather than 202-success so the user knows to try again.
+    /// If token cleanup also fails, both failures are preserved in an aggregate exception.
     /// </exception>
     Task<EmailChangeRequestStatus> RequestAsync(
         Korat.Domain.Auth.UserId userId,
@@ -64,8 +65,9 @@ public interface IEmailChangeService
 
     /// <summary>
     /// Confirms an email-change by validating <paramref name="rawToken"/> against the stored hash.
-    /// On success: promotes the new email to <c>User.PrimaryEmail</c> in the database,
-    /// sends a security-alert email to the old address, and marks the token consumed.
+    /// On success: promotes the new email to <c>User.PrimaryEmail</c> and marks the token
+    /// consumed atomically in PostgreSQL. Then attempts a security alert to the old address;
+    /// notification failure is logged without undoing the committed change.
     /// The caller (endpoint) must subsequently call
     /// <c>IUserGrain.UpdatePrimaryEmailAsync</c> to keep the grain's in-memory cache consistent.
     /// </summary>

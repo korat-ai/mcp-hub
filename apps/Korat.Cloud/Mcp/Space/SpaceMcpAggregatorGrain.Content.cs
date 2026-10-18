@@ -9,7 +9,7 @@ public sealed partial class SpaceMcpAggregatorGrain
 {
     private readonly McpContentCatalog _content = new();
     private readonly HashSet<string> _dirtyCatalogs = new(StringComparer.Ordinal);
-    private Task? _refreshCatalogsTask;
+    private readonly HashSet<string> _refreshingCatalogs = new(StringComparer.Ordinal);
     private string _announcedResources = "";
     private string _announcedTemplates = "";
     private string _announcedPrompts = "";
@@ -343,39 +343,46 @@ public sealed partial class SpaceMcpAggregatorGrain
         }
     }
 
-    private Task RefreshDirtyCatalogsAsync(CancellationToken ct)
+    private void StartDirtyCatalogRefreshes(CancellationToken ct)
     {
-        if (_refreshCatalogsTask is { IsCompleted: false }) return _refreshCatalogsTask;
-        return _refreshCatalogsTask = RefreshDirtyCatalogsCoreAsync(ct);
-    }
-
-    private async Task RefreshDirtyCatalogsCoreAsync(CancellationToken ct)
-    {
+        if (_tornDown) return;
         foreach (var sessionId in _dirtyCatalogs.ToArray())
         {
+            // A notification during a refresh keeps its dirty bit for the next pass.
+            // Each backend has at most one refresh; a hung peer must not hold up others.
+            if (_refreshingCatalogs.Contains(sessionId)) continue;
             _dirtyCatalogs.Remove(sessionId);
             if (!_backendsBySessionId.TryGetValue(sessionId, out var backend) || !backend.IsAlive) continue;
-            try
-            {
-                using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                timeout.CancelAfter(PerBackendTimeout);
-                var tools = await backend.ListToolsAsync(timeout.Token);
-                await backend.ListContentAsync(timeout.Token);
-                var server = await repository.GetMcpServerAsync(new McpServerId(backend.ServerId), timeout.Token);
-                if (_tornDown || !backend.IsAlive || server is null
-                    || !await IsServerGrantedAsync(backend.ServerId, timeout.Token)) continue;
-                _content.SetServer(backend.ServerId, backend.Slug, backend.Resources, backend.ResourceTemplates, backend.Prompts);
-                _catalog.SetGranted(backend.ServerId, backend.Slug, server.DisplayName, tools);
-            }
-            catch (Exception ex)
-            {
-                if (backend.IsAlive) _dirtyCatalogs.Add(sessionId);
-                logger.LogWarning(ex, "Space-MCP: catalog refresh failed serverId={ServerId}", backend.ServerId);
-            }
+            _refreshingCatalogs.Add(sessionId);
+            // Stay on the grain scheduler. This task observes its own failures and teardown
+            // closes the backend, releasing any pending request; no Task.Run is needed.
+            _ = RefreshCatalogAsync(backend, ct);
         }
-        if (_tornDown) return;
-        if (_catalog.ToolsListJson() != _announcedToolsListJson) BumpListChanged();
-        else AnnounceContentChanges();
+    }
+
+    private async Task RefreshCatalogAsync(SpaceBackendSession backend, CancellationToken ct)
+    {
+        try
+        {
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            timeout.CancelAfter(PerBackendTimeout);
+            var tools = await backend.ListToolsAsync(timeout.Token);
+            await backend.ListContentAsync(timeout.Token);
+            var server = await GetGrantedServerAsync(backend.ServerId, timeout.Token);
+            // Permission or backend session may have changed while any await was pending.
+            if (server is null || !IsCurrentBackend(backend)) return;
+            _content.SetServer(backend.ServerId, backend.Slug, backend.Resources, backend.ResourceTemplates, backend.Prompts);
+            _catalog.SetGranted(backend.ServerId, backend.Slug, server.DisplayName, tools);
+            if (_catalog.ToolsListJson() != _announcedToolsListJson) BumpListChanged();
+            else AnnounceContentChanges();
+        }
+        catch (Exception ex)
+        {
+            // Retry on a later pass, not in a tight loop on a failing backend.
+            if (IsCurrentBackend(backend)) _dirtyCatalogs.Add(backend.SessionId);
+            logger.LogWarning(ex, "Space-MCP: catalog refresh failed serverId={ServerId}", backend.ServerId);
+        }
+        finally { _refreshingCatalogs.Remove(backend.SessionId); }
     }
 
     private void RememberContentSnapshot()

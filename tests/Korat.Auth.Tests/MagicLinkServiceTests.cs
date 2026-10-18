@@ -1,9 +1,12 @@
+using System.Net;
 using System.Security.Cryptography;
 using System.Text;
+using Korat.Cloud.Web.Auth.Options;
 using Korat.Cloud.Web.Auth.Services;
 using Korat.Persistence;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Options;
 
 namespace Korat.Auth.Tests;
 
@@ -16,6 +19,19 @@ public class MagicLinkServiceTests
         {
             Sent.Add((toEmail, consumeUrl));
             return Task.CompletedTask;
+        }
+    }
+
+    private sealed class SequencedHttpHandler(params Func<CancellationToken, HttpResponseMessage>[] responses)
+        : HttpMessageHandler
+    {
+        private int _callCount;
+        public int CallCount => _callCount;
+
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
+        {
+            var index = Interlocked.Increment(ref _callCount) - 1;
+            return Task.FromResult(responses[index](ct));
         }
     }
 
@@ -94,6 +110,115 @@ public class MagicLinkServiceTests
         await svc.IssueAsync("a@b.co",  null, null, new Uri("https://test.local"), default);
         await svc.IssueAsync("a@b.co",  null, null, new Uri("https://test.local"), default);
         Assert.Single(mail.Sent);
+    }
+
+    [Fact]
+    public async Task IssueAsync_RealSender503_RemovesOnlyFailedToken_AndImmediateRetrySucceeds()
+    {
+        var opts = new DbContextOptionsBuilder<KoratDbContext>()
+            .UseInMemoryDatabase(Guid.NewGuid().ToString())
+            .Options;
+        var db = new KoratDbContext(opts);
+        var handler = new SequencedHttpHandler(
+            _ => new HttpResponseMessage(HttpStatusCode.ServiceUnavailable),
+            _ => new HttpResponseMessage(HttpStatusCode.OK));
+        var sender = new ResendEmailSender(
+            new HttpClient(handler),
+            Options.Create(new ResendOptions { ApiKey = "test-key" }),
+            NullLogger<ResendEmailSender>.Instance);
+        var svc = new MagicLinkService(db, sender, NullLogger<MagicLinkService>.Instance, TimeProvider.System);
+
+        await svc.IssueAsync("retry@example.com", null, null, new Uri("https://test.local"), default);
+        Assert.Empty(db.MagicLinkTokens);
+
+        await svc.IssueAsync("retry@example.com", null, null, new Uri("https://test.local"), default);
+
+        Assert.Single(db.MagicLinkTokens);
+        Assert.Equal(2, handler.CallCount);
+    }
+
+    [Fact]
+    public async Task IssueAsync_MissingSenderConfiguration_RemovesFailedToken_AndAllowsRetry()
+    {
+        var opts = new DbContextOptionsBuilder<KoratDbContext>()
+            .UseInMemoryDatabase(Guid.NewGuid().ToString())
+            .Options;
+        var db = new KoratDbContext(opts);
+        var handler = new SequencedHttpHandler(
+            _ => new HttpResponseMessage(HttpStatusCode.OK));
+        var misconfiguredSender = new ResendEmailSender(
+            new HttpClient(handler),
+            Options.Create(new ResendOptions { ApiKey = "" }),
+            NullLogger<ResendEmailSender>.Instance);
+        var misconfiguredService = new MagicLinkService(
+            db, misconfiguredSender, NullLogger<MagicLinkService>.Instance, TimeProvider.System);
+
+        await misconfiguredService.IssueAsync(
+            "configure-and-retry@example.com", null, null, new Uri("https://test.local"), default);
+        Assert.Empty(db.MagicLinkTokens);
+        Assert.Equal(0, handler.CallCount);
+
+        var configuredSender = new ResendEmailSender(
+            new HttpClient(handler),
+            Options.Create(new ResendOptions { ApiKey = "test-key" }),
+            NullLogger<ResendEmailSender>.Instance);
+        var configuredService = new MagicLinkService(
+            db, configuredSender, NullLogger<MagicLinkService>.Instance, TimeProvider.System);
+
+        await configuredService.IssueAsync(
+            "configure-and-retry@example.com", null, null, new Uri("https://test.local"), default);
+
+        Assert.Single(db.MagicLinkTokens);
+        Assert.Equal(1, handler.CallCount);
+    }
+
+    [Fact]
+    public async Task IssueAsync_TransportFailure_RemovesFailedToken_AndAllowsRetry()
+    {
+        var opts = new DbContextOptionsBuilder<KoratDbContext>()
+            .UseInMemoryDatabase(Guid.NewGuid().ToString())
+            .Options;
+        var db = new KoratDbContext(opts);
+        var handler = new SequencedHttpHandler(
+            _ => throw new HttpRequestException("transport failed"),
+            _ => new HttpResponseMessage(HttpStatusCode.OK));
+        var sender = new ResendEmailSender(
+            new HttpClient(handler),
+            Options.Create(new ResendOptions { ApiKey = "test-key" }),
+            NullLogger<ResendEmailSender>.Instance);
+        var svc = new MagicLinkService(db, sender, NullLogger<MagicLinkService>.Instance, TimeProvider.System);
+
+        await svc.IssueAsync("transport@example.com", null, null, new Uri("https://test.local"), default);
+        await svc.IssueAsync("transport@example.com", null, null, new Uri("https://test.local"), default);
+
+        Assert.Single(db.MagicLinkTokens);
+        Assert.Equal(2, handler.CallCount);
+    }
+
+    [Fact]
+    public async Task IssueAsync_CallerCancellation_RemovesFailedToken_AndPropagatesCancellation()
+    {
+        var opts = new DbContextOptionsBuilder<KoratDbContext>()
+            .UseInMemoryDatabase(Guid.NewGuid().ToString())
+            .Options;
+        var db = new KoratDbContext(opts);
+        using var cts = new CancellationTokenSource();
+        var handler = new SequencedHttpHandler(ct =>
+        {
+            cts.Cancel();
+            ct.ThrowIfCancellationRequested();
+            throw new InvalidOperationException("Unreachable");
+        });
+        var sender = new ResendEmailSender(
+            new HttpClient(handler),
+            Options.Create(new ResendOptions { ApiKey = "test-key" }),
+            NullLogger<ResendEmailSender>.Instance);
+        var svc = new MagicLinkService(db, sender, NullLogger<MagicLinkService>.Instance, TimeProvider.System);
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            svc.IssueAsync("cancel@example.com", null, null, new Uri("https://test.local"), cts.Token));
+
+        Assert.Empty(db.MagicLinkTokens);
     }
 
     // F5: consuming with the correct raw token (from email URL) must succeed.

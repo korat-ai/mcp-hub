@@ -1,4 +1,4 @@
-import { createFileRoute, Link, useSearch } from '@tanstack/react-router'
+import { createFileRoute, Link, Outlet, useSearch } from '@tanstack/react-router'
 import { useState } from 'react'
 import { useMagicLinkRequest } from '@/hooks/useMagicLinkRequest'
 
@@ -14,11 +14,15 @@ export const Route = createFileRoute('/signin')({
     if (typeof search.error === 'string') out.error = search.error
     return out
   },
-  component: SignInPage,
+  component: SignInLayout,
 })
 
 /** Exported for test harness — allows mounting SignInPage in a minimal router. */
 export { SignInPage }
+
+function SignInLayout() {
+  return <Outlet />
+}
 
 function providerHref(provider: string, returnUrl?: string) {
   const params = new URLSearchParams()

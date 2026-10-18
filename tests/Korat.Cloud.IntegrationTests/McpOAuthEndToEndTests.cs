@@ -231,6 +231,7 @@ public sealed class McpOAuthEndToEndTests(KoratIntegrationFixture fixture) : ICl
 
         var client = factory.CreateClient(new WebApplicationFactoryClientOptions { AllowAutoRedirect = false });
         client.DefaultRequestHeaders.Add("Cookie", $"{Korat.Cloud.Web.Auth.CanonicalSigninHandler.SessionCookieName}={session.Id:N}");
+        fixture.AttachAntiforgeryTokens(client, factory);
         return client;
     }
 

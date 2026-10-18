@@ -110,7 +110,7 @@ public sealed class EmailChangeTests(KoratIntegrationFixture fixture) : IClassFi
         // Authenticated (full-scope cookie) but no antiforgery token: the scope filter passes,
         // then antiforgery rejects the mutating request with 400. (Unauthenticated → 401.)
         var seeded = await fixture.SeedUserAsync($"ec-noxsrf-{Guid.NewGuid():N}@example.com", "Name");
-        using var client = await fixture.CreateAuthenticatedClientAsync(seeded.UserId);
+        using var client = await fixture.CreateCookieAuthenticatedClientAsync(seeded.UserId);
 
         var resp = await client.PostAsJsonAsync("/api/auth/email/change", new { newEmail = "x@example.com" });
 
@@ -432,7 +432,7 @@ public sealed class EmailChangeConfirmEndpointTests(KoratIntegrationFixture fixt
         // Authenticated (full-scope cookie) but no antiforgery token: the scope filter passes,
         // then antiforgery rejects the mutating request with 400. (Unauthenticated → 401.)
         var seeded = await fixture.SeedUserAsync($"ec-confirm-noxsrf-{Guid.NewGuid():N}@example.com", "Name");
-        using var client = await fixture.CreateAuthenticatedClientAsync(seeded.UserId);
+        using var client = await fixture.CreateCookieAuthenticatedClientAsync(seeded.UserId);
 
         var resp = await client.PostAsJsonAsync(
             "/api/auth/email/change/confirm", new { token = "any" });

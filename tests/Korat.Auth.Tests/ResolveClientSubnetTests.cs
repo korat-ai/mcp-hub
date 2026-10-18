@@ -81,12 +81,12 @@ public class ResolveClientSubnetTests
     }
 
     [Fact]
-    public void FlyClientIpHeader_TrustedFlagOn_UsesHeaderForSubnetKey()
+    public void FlyClientIpHeader_TrustedFlagOn_CannotSpoofSubnetKey()
     {
         var ctx = BuildContext(remoteIp: "10.0.0.1");
         ctx.Request.Headers["Fly-Client-IP"] = "9.9.9.5";
         var key = RateLimiterRegistration.ResolveClientSubnet(ctx, trustForwardedIp: true);
-        Assert.Equal("dcr-subnet4:9.9.9.0/24", key);
+        Assert.Equal("dcr-subnet4:10.0.0.0/24", key);
     }
 
     [Fact]

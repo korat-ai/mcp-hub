@@ -19,7 +19,8 @@ export function AuthGate({ children }: { children: ReactNode }) {
   const location = useRouterState({ select: (s) => s.location });
 
   const is401 = error instanceof ApiError && error.status === 401;
-  const atSignIn = location.pathname === '/signin';
+  const atSignIn =
+    location.pathname === '/signin' || location.pathname.startsWith('/signin/');
 
   useEffect(() => {
     if (is401 && !atSignIn) {

@@ -99,6 +99,37 @@ public class ResendEmailChangeEmailSenderTests
         Assert.Empty(logger.Messages);
     }
 
+    [Fact]
+    public async Task SendVerificationLinkAsync_FailedResponse_ThrowsWithoutLoggingProviderBodyOrRawToken()
+    {
+        const string rawToken = "provider-echoed-raw-token";
+        var logger = new CapturingLogger();
+        var handler = new StubResponseHandler(new HttpResponseMessage(HttpStatusCode.ServiceUnavailable)
+        {
+            Content = new StringContent($"provider echoed token={rawToken}"),
+        });
+        var sender = new ResendEmailChangeEmailSender(
+            new HttpClient(handler),
+            Options.Create(new ResendOptions
+            {
+                ApiKey = "live-key",
+                FromEmail = "noreply@example.com",
+                FromName = "Korat",
+            }),
+            logger);
+
+        var exception = await Assert.ThrowsAsync<HttpRequestException>(() =>
+            sender.SendVerificationLinkAsync(
+                "user@example.com",
+                new Uri($"https://app.example.com/app/account/verify-email?token={rawToken}"),
+                TimeSpan.FromMinutes(30),
+                default));
+
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, exception.StatusCode);
+        Assert.Contains(logger.Messages, message => message.Contains("503", StringComparison.Ordinal));
+        Assert.DoesNotContain(logger.Messages, message => message.Contains(rawToken, StringComparison.Ordinal));
+    }
+
     private sealed class StubOkHandler(Action<HttpRequestMessage> onSend) : HttpMessageHandler
     {
         protected override Task<HttpResponseMessage> SendAsync(
@@ -114,5 +145,11 @@ public class ResendEmailChangeEmailSenderTests
             onSend(request);
             return new HttpResponseMessage(HttpStatusCode.OK);
         }
+    }
+
+    private sealed class StubResponseHandler(HttpResponseMessage response) : HttpMessageHandler
+    {
+        protected override Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request, CancellationToken ct) => Task.FromResult(response);
     }
 }

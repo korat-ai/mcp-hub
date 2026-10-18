@@ -1,4 +1,5 @@
 using Korat.Cloud.Web.Auth;
+using Korat.Cloud.Web.Auth.Security;
 
 namespace Korat.Cloud.Web;
 
@@ -34,5 +35,5 @@ public static class RequireAuthExtensions
             // Stash the resolved UserId for downstream handlers (consumed in Sub-project 2).
             ctx.HttpContext.Items[KoratHttpContextItems.UserIdKey] = identity.UserId;
             return await next(ctx);
-        });
+        }).RequireAntiforgeryUnlessHeadless();
 }

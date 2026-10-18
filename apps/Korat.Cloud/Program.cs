@@ -20,7 +20,6 @@ using Korat.Cloud.Web.Oauth;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication.Cookies;
 using Microsoft.AspNetCore.DataProtection;
-using Microsoft.AspNetCore.HttpOverrides;
 using Korat.Domain;
 using Korat.Domain.Entities;
 using Korat.Domain.Persistence;
@@ -37,6 +36,10 @@ using OpenTelemetry.Trace;
 
 var builder = WebApplication.CreateBuilder(args);
 var isTesting = builder.Environment.IsEnvironment("Testing");
+var migrateOnly = args.Contains("migrate");
+// A migration command always uses the relational provider, including in an isolated test.
+// Otherwise a successful test-environment migration would leave the application DB empty.
+var useInMemoryStore = isTesting && !migrateOnly;
 
 // ── Error tracking ─────────────────────────────────────────────────────────
 // Sentry / GlitchTip integration. DSN-gated: when SENTRY_DSN is unset or empty
@@ -525,7 +528,7 @@ if (!builder.Environment.IsDevelopment() && !isTesting)
     }
 }
 
-if (isTesting)
+if (useInMemoryStore)
 {
     builder.Services.AddDbContextFactory<KoratDbContext>(options =>
         options.UseInMemoryDatabase("korat-test"));
@@ -599,7 +602,7 @@ builder.Services.AddOpenIddict()
             // (non-Testing) supports bulk delete natively, so this fallback to the row-by-row
             // Remove()+SaveChangesAsync() path is Testing-only; production keeps the faster
             // bulk-delete path unchanged.
-            if (isTesting)
+            if (useInMemoryStore)
                 ef.DisableBulkOperations();
         });
     })
@@ -845,36 +848,9 @@ builder.Services.AddAntiforgery(opts =>
     opts.Cookie.SameSite = SameSiteMode.Lax;
 });
 
-// SEC-H1/L1: TrustForwardedIp gates two behaviours:
-//   1. app.UseForwardedHeaders() (below in the pipeline) — rewrites
-//      RemoteIpAddress + Request.Scheme from X-Forwarded-For + X-Forwarded-Proto.
-//   2. RateLimiterRegistration.ResolveClientIp — reads Fly-Client-IP only when
-//      this flag is true; otherwise falls back to RemoteIpAddress.
-//
-// Set to true ONLY on deployments where all inbound traffic is forced through
-// Fly's edge proxy. In Development / direct-host scenarios this flag must stay
-// false; spoofing Fly-Client-IP from outside the proxy is trivial otherwise.
-//
-// appsettings.json: "Korat": { "Cloud": { "TrustForwardedIp": false } }
-// Fly deploy: set via KORAT__CLOUD__TRUSTFORWARDEDIP=true in fly.toml [env].
-var trustForwardedIp = builder.Configuration.GetValue<bool>("Korat:Cloud:TrustForwardedIp");
-
-if (trustForwardedIp)
-{
-    builder.Services.Configure<ForwardedHeadersOptions>(opts =>
-    {
-        opts.ForwardedHeaders = ForwardedHeaders.XForwardedFor | ForwardedHeaders.XForwardedProto;
-        // Accept exactly one hop — the Fly edge proxy.
-        opts.ForwardLimit = 1;
-        // Clear the broad ASP.NET default (any RFC1918 range); only trust Fly's
-        // internal IPv6-mapped range (::ffff:172.16.0.0/12 covers the Fly edge
-        // addresses that appear as RemoteIpAddress on the loopback interface).
-        opts.KnownIPNetworks.Clear();
-        opts.KnownProxies.Clear();
-        opts.KnownIPNetworks.Add(new System.Net.IPNetwork(IPAddress.Parse("::ffff:172.16.0.0"), 108)); // /108 = /12 IPv4 mapped
-        opts.KnownIPNetworks.Add(new System.Net.IPNetwork(IPAddress.Parse("172.16.0.0"), 12));          // plain IPv4 fallback
-    });
-}
+// Forwarded headers are accepted only from explicitly configured proxy addresses.
+// All consumers use the resulting Scheme/RemoteIpAddress, never raw client headers.
+var trustForwardedIp = builder.Services.AddKoratForwardedHeaders(builder.Configuration);
 
 // Space-MCP inc-2b (Task 4) + registration-flood-DoS hardening item 3: thread the DCR per-IP
 // permit (SpaceMcpDcrOptions.RegisterRateLimitPerMinute) AND the per-subnet permit
@@ -1171,9 +1147,8 @@ _ = app.Services.GetRequiredService<Korat.Cloud.Web.Auth.Services.ISsoTokenValid
 //
 // The gate is `clustered`, not the hosting provider: what makes an unattended migration
 // unsafe is more than one process racing to apply it, and that is exactly what clustering
-// means. The one designated migrator is a Kubernetes Job running this same image with the
-// `migrate` argument; the Deployment waits on that Job before rolling.
-var migrateOnly = args.Contains("migrate");
+// means. A designated migrator runs this same image with the `migrate` argument.
+// The surrounding orchestration must wait for its success before starting dependent silos.
 var runMigrations = migrateOnly
     || !clustered
     || Environment.GetEnvironmentVariable("KORAT_RUN_MIGRATIONS") == "1";
@@ -1182,13 +1157,15 @@ if (runMigrations)
 {
     using var scope = app.Services.CreateScope();
     var repository = scope.ServiceProvider.GetRequiredService<IMetadataRepository>();
-    await repository.EnsureCreatedAsync();
 
-    // Orleans ADO.NET membership tables live outside the EF model — apply the official
-    // PostgreSQL clustering schema idempotently. Must exist before any silo joins; runs in
-    // the same operator-controlled migration window as EF to avoid a multi-instance race.
-    if (clustered)
-        await Korat.Cloud.Clustering.OrleansAdoNetSchema.EnsureAsync(connectionString);
+    // A migration-only process has no advertised silo IP, but must prepare the same
+    // database the clustered application will join. Complete both schemas and verify
+    // Orleans before reporting success; the local/in-memory path needs only the app schema.
+    if (migrateOnly || clustered)
+        await Korat.Cloud.Clustering.MigrationCoordinator.RunAsync(
+            connectionString, ct => repository.EnsureCreatedAsync(ct));
+    else
+        await repository.EnsureCreatedAsync();
 }
 
 // Exit before binding any listener. Without this the migration Job would go on to serve
@@ -1224,24 +1201,6 @@ app.Use(async (context, next) =>
 if (trustForwardedIp)
 {
     app.UseForwardedHeaders();
-    // Belt-and-suspenders for the OAuth callback path. UseForwardedHeaders
-    // intermittently does NOT apply X-Forwarded-Proto on /signin/{provider}/callback
-    // — its KnownIPNetworks/ForwardLimit check rejects the Fly edge hop on that request,
-    // so Request.Scheme stays "http" even though the header says "https". The OAuth
-    // handler then builds an http:// redirect_uri at token-exchange while the authorize
-    // step used https://, so GitHub rejects the exchange with redirect_uri_mismatch.
-    // (Observed in production: authorize Scheme=https, callback Scheme=http with
-    // XFProto=https present-but-unconsumed.) Force the scheme from the forwarded header
-    // unconditionally; safe because this block only runs behind the trusted Fly proxy.
-    app.Use((ctx, next) =>
-    {
-        var proto = ctx.Request.Headers["X-Forwarded-Proto"].ToString();
-        if (proto.StartsWith("https", StringComparison.OrdinalIgnoreCase))
-        {
-            ctx.Request.Scheme = "https";
-        }
-        return next();
-    });
 }
 
 // SEC-MED-1: emit baseline security response headers (X-Content-Type-Options, X-Frame-Options,
@@ -1252,8 +1211,13 @@ app.UseKoratSecurityHeaders();
 // Static assets (/app/assets/*.js, *.css, fonts) are intentionally public and
 // unauthenticated — running rate-limiter or antiforgery middleware on them
 // wastes rate-limit budget on page-load asset bursts and adds unnecessary latency.
-// There are no auth-protected static file paths, so early exit is safe.
-app.UseDefaultFiles();
+// The SPA shell must reach IssueAntiforgery below, even when requested as a physical file.
+// A valid long-lived session cookie can outlive the browser's session-only CSRF cookies.
+static bool IsSpaShellPath(PathString path) =>
+    path.Equals("/app", StringComparison.OrdinalIgnoreCase)
+    || path.Equals("/app/", StringComparison.OrdinalIgnoreCase)
+    || path.Equals("/app/index.html", StringComparison.OrdinalIgnoreCase);
+app.UseWhen(ctx => !IsSpaShellPath(ctx.Request.Path), branch => branch.UseDefaultFiles());
 // SPA static assets: direct file-serving middleware for /app/* requests.
 // UseStaticFiles() alone is insufficient because the default WebRootFileProvider in
 // .NET 10 SDK projects is backed by the StaticWebAssets manifest
@@ -1272,7 +1236,8 @@ var spaIndexPath = spaWebRoot.Length > 0 ? Path.Combine(spaWebRoot, "index.html"
 app.Use(async (context, next) =>
 {
     var path = context.Request.Path.Value ?? "";
-    if (spaWebRoot.Length > 0 && path.StartsWith("/app/", StringComparison.OrdinalIgnoreCase) && path.Length > 5)
+    if (!IsSpaShellPath(context.Request.Path)
+        && spaWebRoot.Length > 0 && path.StartsWith("/app/", StringComparison.OrdinalIgnoreCase) && path.Length > 5)
     {
         // Strip the /app prefix to get the relative sub-path within wwwroot/app/.
         var subPath = path[4..]; // e.g. "/assets/index-Dk7bcs9i.js"
@@ -1314,7 +1279,7 @@ app.Use(async (context, next) =>
     }
     await next();
 });
-app.UseStaticFiles();
+app.UseWhen(ctx => !IsSpaShellPath(ctx.Request.Path), branch => branch.UseStaticFiles());
 
 // Auth + rate-limiting middleware runs only for requests that static files did NOT serve.
 // Dynamic API + SPA HTML routes (including /app/signin) run through this protected pipeline.
@@ -1326,7 +1291,7 @@ app.UseStaticFiles();
 // exchange before the forwarded X-Forwarded-Proto was applied, saw Request.Scheme=http,
 // and built an http:// redirect_uri while the authorize step had used https://. GitHub
 // then rejected the exchange with redirect_uri_mismatch. Calling them explicitly here —
-// after the scheme fix — makes the callback handler observe the correct https scheme.
+// after trusted forwarded headers — makes the callback handler observe the correct scheme.
 // Only UseAuthentication is needed — the OAuth RemoteAuthenticationHandler runs here and
 // the callback handler observes the (now https) scheme. UseAuthorization is intentionally
 // NOT called: this app does manual authorization (no AddAuthorization / policy services

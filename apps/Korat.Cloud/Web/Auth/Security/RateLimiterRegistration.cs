@@ -106,12 +106,8 @@ public static class RateLimiterRegistration
     /// </summary>
     /// <param name="services">The service collection.</param>
     /// <param name="trustForwardedIp">
-    /// When <c>true</c>, <see cref="ResolveClientIp"/> will read the <c>Fly-Client-IP</c>
-    /// header before falling back to <see cref="ConnectionInfo.RemoteIpAddress"/>.
-    /// Must only be <c>true</c> when all inbound traffic is forced through Fly's edge proxy
-    /// and <c>app.UseForwardedHeaders()</c> has already been registered in the pipeline.
-    /// When <c>false</c>, the header is ignored even if present — preventing any client
-    /// from trivially spoofing its own IP to bypass per-IP rate limits.
+    /// Retained for callers; IP resolution always uses <see cref="ConnectionInfo.RemoteIpAddress"/>.
+    /// When forwarding is enabled, trusted-proxy middleware must run before rate limiting.
     /// </param>
     /// <param name="dcrRegisterSubnetPerMinute">
     /// Registration-flood-DoS hardening item 3: per-/24-IPv4 (/48-IPv6) permit for
@@ -205,10 +201,8 @@ public static class RateLimiterRegistration
     /// </summary>
     /// <param name="ctx">The current HTTP context.</param>
     /// <param name="trustForwardedIp">
-    /// When <c>true</c>, reads <c>Fly-Client-IP</c> first (set by Fly's edge proxy to
-    /// the actual client address). When <c>false</c>, the header is ignored to prevent
-    /// spoofing on non-Fly or misconfigured deployments — <see cref="ConnectionInfo.RemoteIpAddress"/>
-    /// is the only trusted source in that case.
+    /// Retained for callers. Raw forwarded headers are never trusted here, regardless
+    /// of the flag; only the middleware-validated <see cref="ConnectionInfo.RemoteIpAddress"/> is used.
     /// </param>
     /// <remarks>
     /// When <c>trustForwardedIp=true</c>, <c>app.UseForwardedHeaders()</c> must be registered
@@ -216,8 +210,7 @@ public static class RateLimiterRegistration
     /// correctly rewritten for all other middleware (audit logs, magic-link Origin check, etc.).
     /// </remarks>
     internal static string ResolveClientIp(HttpContext ctx, bool trustForwardedIp) =>
-        (trustForwardedIp ? ctx.Request.Headers["Fly-Client-IP"].FirstOrDefault() : null)
-            ?? ctx.Connection.RemoteIpAddress?.ToString()
+        ctx.Connection.RemoteIpAddress?.ToString()
             ?? "anon";
 
     /// <summary>

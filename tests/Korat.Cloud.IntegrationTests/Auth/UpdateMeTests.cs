@@ -85,7 +85,7 @@ public sealed class UpdateMeTests(KoratIntegrationFixture fixture) : IClassFixtu
     public async Task PutMe_WithoutAntiforgeryToken_Returns400()
     {
         var seeded = await fixture.SeedUserAsync($"putme-noxsrf-{Guid.NewGuid():N}@example.com", "Name");
-        using var client = await fixture.CreateAuthenticatedClientAsync(seeded.UserId);
+        using var client = await fixture.CreateCookieAuthenticatedClientAsync(seeded.UserId);
 
         var resp = await client.PutAsJsonAsync("/api/auth/me", new { displayName = "Hacker" });
 

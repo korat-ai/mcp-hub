@@ -100,6 +100,33 @@ public sealed class PendingLinkConfirmTests(KoratIntegrationFixture fixture)
     }
 
     [Fact]
+    public async Task Confirm_AfterUserIsSuspended_DoesNotLinkOrCreateAnotherSession()
+    {
+        var seeded = await fixture.SeedUserAsync($"link-suspended-{Guid.NewGuid():N}@example.com", "Suspended Link");
+        var providerUserId = $"gh-{Guid.NewGuid():N}";
+        using var client = await CreateClientWithPendingLinkAsync(seeded.UserId, providerUserId);
+
+        int sessionsBefore;
+        using (var scope = fixture.Factory.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<KoratDbContext>();
+            var user = await db.Users.SingleAsync(u => u.Id == seeded.UserId);
+            db.Entry(user).CurrentValues.SetValues(user with { Status = UserStatus.Suspended });
+            await db.SaveChangesAsync();
+            sessionsBefore = await db.AuthSessions.CountAsync(s => s.UserId == seeded.UserId);
+        }
+
+        var response = await client.PostAsync("/api/auth/pending-link/confirm", null);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        using var verifyScope = fixture.Factory.Services.CreateScope();
+        var verifyDb = verifyScope.ServiceProvider.GetRequiredService<KoratDbContext>();
+        Assert.False(await verifyDb.ExternalLogins.AsNoTracking()
+            .AnyAsync(x => x.ProviderUserId == providerUserId));
+        Assert.Equal(sessionsBefore, await verifyDb.AuthSessions.CountAsync(s => s.UserId == seeded.UserId));
+    }
+
+    [Fact]
     public async Task Cancel_RemovesThePendingLink_WithoutLinking()
     {
         var seeded = await fixture.SeedUserAsync($"link-cancel-{Guid.NewGuid():N}@example.com", "Link Cancel");

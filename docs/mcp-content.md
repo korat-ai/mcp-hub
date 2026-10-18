@@ -58,6 +58,11 @@ Keep a GET event stream open on the same MCP session to receive
 `notifications/resources/list_changed`, `notifications/prompts/list_changed`,
 and `notifications/tools/list_changed`. Re-list the corresponding catalog.
 
+Upstream catalog changes refresh independently per source. While a refresh is
+pending, lists return the last authorized snapshot; a slow source does not
+delay the other sources or their change notifications. Access is checked again
+before listing cached content and before accepting a refreshed catalog.
+
 After subscribing, `notifications/resources/updated` carries the namespaced
 URI; read it again for current contents. Updates are invalidations, not a
 durable event history, and repeated updates may be coalesced. They are not

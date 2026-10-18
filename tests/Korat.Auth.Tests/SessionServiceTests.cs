@@ -19,6 +19,24 @@ public class SessionServiceTests
         return (svc, db, time);
     }
 
+    private static async Task<UserId> SeedUserAsync(
+        KoratDbContext db,
+        UserStatus status = UserStatus.Active)
+    {
+        var userId = UserId.New();
+        db.Users.Add(new User
+        {
+            Id = userId,
+            PrimaryEmail = $"session-{userId.Value:N}@example.com",
+            DisplayName = "Session Test User",
+            CreatedAt = DateTimeOffset.UtcNow,
+            Status = status,
+            IsAdmin = false,
+        });
+        await db.SaveChangesAsync();
+        return userId;
+    }
+
     [Fact]
     public async Task CreateAsync_PersistsSession_WithSlidingAndAbsoluteCaps()
     {
@@ -33,8 +51,8 @@ public class SessionServiceTests
     [Fact]
     public async Task ValidateAndBumpAsync_ReturnsUserId_AndAdvancesExpiresAt()
     {
-        var (svc, _, time) = Build();
-        var userId = UserId.New();
+        var (svc, db, time) = Build();
+        var userId = await SeedUserAsync(db);
         var session = await svc.CreateAsync(userId, null, null, default);
         // Capture before advancing — EF InMemory mutates the tracked entity object in-place
         // when SetValues is called, so session.ExpiresAt would reflect the bumped value after the call.
@@ -49,8 +67,8 @@ public class SessionServiceTests
     [Fact]
     public async Task ValidateAndBumpAsync_ReturnsNull_AfterRevoke()
     {
-        var (svc, _, _) = Build();
-        var session = await svc.CreateAsync(UserId.New(), null, null, default);
+        var (svc, db, _) = Build();
+        var session = await svc.CreateAsync(await SeedUserAsync(db), null, null, default);
         await svc.RevokeAsync(session.Id, default);
         var bumped = await svc.ValidateAndBumpAsync(session.Id, default);
         Assert.Null(bumped);
@@ -59,11 +77,25 @@ public class SessionServiceTests
     [Fact]
     public async Task ValidateAndBumpAsync_ReturnsNull_AfterAbsoluteCapExpires()
     {
-        var (svc, _, time) = Build();
-        var session = await svc.CreateAsync(UserId.New(), null, null, default);
+        var (svc, db, time) = Build();
+        var session = await svc.CreateAsync(await SeedUserAsync(db), null, null, default);
         time.Advance(SessionService.AbsoluteCap + TimeSpan.FromHours(1));
         var bumped = await svc.ValidateAndBumpAsync(session.Id, default);
         Assert.Null(bumped);
+    }
+
+    [Fact]
+    public async Task ValidateAndBumpAsync_ReturnsNull_WhenUserWasSuspendedAfterSessionCreation()
+    {
+        var (svc, db, _) = Build();
+        var userId = await SeedUserAsync(db);
+        var session = await svc.CreateAsync(userId, null, null, default);
+
+        var user = await db.Users.SingleAsync(u => u.Id == userId);
+        db.Entry(user).CurrentValues.SetValues(user with { Status = UserStatus.Suspended });
+        await db.SaveChangesAsync();
+
+        Assert.Null(await svc.ValidateAndBumpAsync(session.Id, default));
     }
 
     [Fact]

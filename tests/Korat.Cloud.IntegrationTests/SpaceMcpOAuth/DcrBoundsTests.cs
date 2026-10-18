@@ -4,6 +4,7 @@ using System.Text.Json;
 using System.Text.Json.Nodes;
 using Korat.Cloud.Web.Oauth;
 using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
@@ -197,36 +198,9 @@ public sealed class DcrBoundsTests(KoratIntegrationFixture fixture) : IClassFixt
     /// Registration-flood-DoS hardening item 3: behavioral proof that the per-SUBNET window
     /// engages on <c>POST /connect/register</c>, distinctly from the pre-existing per-IP window.
     ///
-    /// Two layers of the SAME "eager read, no WithWebHostBuilder override" limitation this
-    /// class's Reality note documents for <c>RegisterRateLimitPerMinute</c> ALSO apply here,
-    /// and to <c>Korat:Cloud:TrustForwardedIp</c> itself (read the identical way, at the
-    /// identical point in Program.cs, before builder.Build()):
-    /// <list type="bullet">
-    ///   <item>Neither <see cref="DefaultRegisterSubnetRateLimitPerMinute"/> nor the per-IP
-    ///   permit can be dialed via a <c>WithWebHostBuilder</c>-time <c>ConfigureAppConfiguration</c>
-    ///   override — both must be driven at their record defaults (20/min per-IP,
-    ///   60/min per-subnet) on this isolated host.</item>
-    ///   <item><c>Korat:Cloud:TrustForwardedIp</c> is fixed <c>false</c> in every test host in
-    ///   this suite (no override reaches it either) — so <c>Fly-Client-IP</c> is normally
-    ///   ignored and every in-process TestServer request resolves to the SAME client IP
-    ///   ("anon", since <c>RemoteIpAddress</c> is null on the in-memory transport). With BOTH
-    ///   limiters keyed identically under that default, per-IP (20) always fires before subnet
-    ///   (60) in a plain volume test — that would only re-prove the pre-existing per-IP test,
-    ///   never isolate the new subnet dimension.</item>
-    /// </list>
-    /// This test breaks that deadlock the same way <c>DeveloperApiAuthGateTests</c>
-    /// ("the flag is read once at host build. Restore the variable afterwards — the test
-    /// assembly is non-parallel.") does for <c>KORAT_ENABLE_DEVELOPER_API</c>: set the
-    /// <c>KORAT__CLOUD__TRUSTFORWARDEDIP</c> ENVIRONMENT VARIABLE (not app configuration)
-    /// BEFORE the host is built. <c>WebApplication.CreateBuilder(args)</c> wires
-    /// <c>AddEnvironmentVariables()</c> as one of its OWN default sources, loaded synchronously
-    /// at builder-creation time — strictly before Program.cs's <c>trustForwardedIp</c> eager
-    /// read — so, unlike a <c>WithWebHostBuilder</c> override, this DOES reach it. The variable
-    /// is restored immediately after the client is created (this test assembly disables
-    /// parallelization).
-    ///
-    /// With <c>trustForwardedIp=true</c> on this ONE isolated host, distinct <c>Fly-Client-IP</c>
-    /// values are sent, all within one /24 — each gets its OWN per-IP bucket (one request each,
+    /// The isolated host enables the explicit trusted-proxy allowlist. Requests arrive from
+    /// that proxy and carry distinct X-Forwarded-For addresses within one /24. Each gets its
+    /// OWN per-IP bucket (one request each,
     /// nowhere near the 20/min per-IP cap) but all share the SAME subnet bucket
     /// (<c>dcr-subnet4:203.0.113.0/24</c>, default 60/min). A 429 can therefore ONLY come from
     /// the subnet limiter, never the per-IP one — proving it is wired up and engages.
@@ -234,45 +208,40 @@ public sealed class DcrBoundsTests(KoratIntegrationFixture fixture) : IClassFixt
     [Fact]
     public async Task SubnetRateLimit_DistinctIpsInSameSubnet_Returns429FromSubnetBucket()
     {
-        var previousTrustForwardedIp = Environment.GetEnvironmentVariable("KORAT__CLOUD__TRUSTFORWARDEDIP");
-        Environment.SetEnvironmentVariable("KORAT__CLOUD__TRUSTFORWARDEDIP", "true");
-        WebApplicationFactory<Program> host;
-        HttpClient client;
-        try
-        {
-            host = fixture.Factory.WithWebHostBuilder(_ => { });
-            client = host.CreateClient();
-        }
-        finally
-        {
-            Environment.SetEnvironmentVariable("KORAT__CLOUD__TRUSTFORWARDEDIP", previousTrustForwardedIp);
-        }
-
-        using (host)
+        using (var host = ForwardedTestHost.Create(fixture.Factory))
         {
             var firstRejectIndex = -1;
             for (var i = 0; i < DefaultRegisterSubnetRateLimitPerMinute + 5; i++)
             {
-                var request = new HttpRequestMessage(HttpMethod.Post, "/connect/register")
-                {
-                    Content = RegisterBody($"http://127.0.0.1:{7000 + i}/cb"),
-                };
+                using var body = RegisterBody($"http://127.0.0.1:{7000 + i}/cb");
+                using var bodyStream = await body.ReadAsStreamAsync();
                 // TEST-NET-3 (RFC 5737) — reserved, non-routable, safe to hardcode. Every value
                 // below is a DISTINCT host within one /24, so the per-IP bucket for each of them
                 // sees exactly one request this whole loop.
-                request.Headers.Add("Fly-Client-IP", $"203.0.113.{i + 1}");
-                var response = await client.SendAsync(request);
-                if (response.StatusCode == HttpStatusCode.TooManyRequests)
+                var response = await host.Server.SendAsync(ctx =>
+                {
+                    ctx.Connection.RemoteIpAddress = IPAddress.Parse("10.42.0.9");
+                    ctx.Request.Method = "POST";
+                    ctx.Request.Scheme = "http";
+                    ctx.Request.Host = new HostString("localhost");
+                    ctx.Request.Path = "/connect/register";
+                    ctx.Request.ContentType = "application/json";
+                    ctx.Request.Body = bodyStream;
+                    ctx.Request.ContentLength = bodyStream.Length;
+                    ctx.Request.Headers["X-Forwarded-For"] = $"203.0.113.{i + 1}";
+                    ctx.Request.Headers["X-Forwarded-Proto"] = "https";
+                });
+                if (response.Response.StatusCode == StatusCodes.Status429TooManyRequests)
                 {
                     firstRejectIndex = i;
-                    Assert.NotNull(response.Headers.RetryAfter);
+                    Assert.False(string.IsNullOrEmpty(response.Response.Headers.RetryAfter));
                     break;
                 }
             }
 
             // Attribution guard (fable SHOULD-FIX): a 429 alone is NOT enough. If the env-var
             // plumbing that flips trustForwardedIp on ever silently breaks (key rename, eager-read
-            // moves ahead of AddEnvironmentVariables, etc.), Fly-Client-IP is ignored and all 65
+            // moves ahead of AddEnvironmentVariables, etc.), X-Forwarded-For is ignored and all 65
             // requests collapse into the ONE "anon" per-IP bucket — the 429 would then come from
             // the per-IP limiter at request #21, proving nothing about the subnet dimension (the
             // subnet branch could be deleted and this test would still go green). Each DISTINCT IP

@@ -7,8 +7,8 @@ namespace Korat.Auth.Tests;
 /// <summary>
 /// Tests for RateLimiterRegistration.ResolveClientIp:
 ///   (a) flag off → Fly-Client-IP header ignored even if present
-///   (b) flag on  → Fly-Client-IP header used when present
-///   (c) flag on, header absent → falls back to RemoteIpAddress
+///   (b) flag on  → raw headers are still ignored
+///   (c) RemoteIpAddress is the sole source, already validated by proxy middleware
 /// </summary>
 public class ResolveClientIpTests
 {
@@ -33,13 +33,12 @@ public class ResolveClientIpTests
     }
 
     [Fact]
-    public void FlagOn_HeaderPresent_UsesHeaderValue()
+    public void FlagOn_HeaderPresent_UsesRemoteIpAddress()
     {
-        // When TrustForwardedIp=true the Fly-Client-IP header wins over RemoteIpAddress
-        // (RemoteIpAddress would be the Fly edge proxy address, not the real client).
+        // An arbitrary header must not bypass middleware's trusted-proxy check.
         var ctx = BuildContext(flyHeader: "5.6.7.8", remoteIp: "10.0.0.1");
         var result = RateLimiterRegistration.ResolveClientIp(ctx, trustForwardedIp: true);
-        Assert.Equal("5.6.7.8", result);
+        Assert.Equal("10.0.0.1", result);
     }
 
     [Fact]

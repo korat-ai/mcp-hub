@@ -61,7 +61,10 @@ public sealed class CanonicalSigninHandler(
         var uaHash = string.IsNullOrEmpty(ua) ? null : Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(ua)).AsSpan(0, 16));
 
         var configuredAdminEmail = bootstrapOptions.Value.AdminEmail?.Trim().ToLowerInvariant();
-        var isAdminEmail = !string.IsNullOrEmpty(configuredAdminEmail)
+        // A returning provider subject proves account identity, not ownership of a newly
+        // asserted email. Bootstrap privileges require the current email claim be verified.
+        var isAdminEmail = req.EmailVerified
+                           && !string.IsNullOrEmpty(configuredAdminEmail)
                            && normalisedEmail is not null
                            && normalisedEmail == configuredAdminEmail;
 
@@ -73,6 +76,13 @@ public sealed class CanonicalSigninHandler(
         if (existing is not null)
         {
             user = await db.Users.SingleAsync(u => u.Id == existing.UserId, ct);
+
+            if (user.Status != UserStatus.Active)
+            {
+                logger.LogWarning(
+                    "Signin rejected for inactive user {UserId} via {Provider}", user.Id, req.Provider);
+                return Results.Redirect("/app/signin?error=signin_failed");
+            }
 
             // Idempotent promote: if the returning user's email matches Bootstrap:AdminEmail
             // and IsAdmin is not yet set, elevate them now.
@@ -90,9 +100,17 @@ public sealed class CanonicalSigninHandler(
         {
             // Verified email — check for auto-link candidate.
             var byEmail = await db.Users.FirstOrDefaultAsync(u =>
-                u.PrimaryEmail == normalisedEmail && u.Status == UserStatus.Active, ct);
+                u.PrimaryEmail == normalisedEmail, ct);
             if (byEmail is not null)
             {
+                if (byEmail.Status != UserStatus.Active)
+                {
+                    logger.LogWarning(
+                        "Signin rejected for inactive user {UserId} via new {Provider} identity",
+                        byEmail.Id, req.Provider);
+                    return Results.Redirect("/app/signin?error=signin_failed");
+                }
+
                 // Idempotent promote before routing through the interstitial.
                 if (isAdminEmail && !byEmail.IsAdmin)
                 {

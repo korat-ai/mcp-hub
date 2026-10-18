@@ -18,7 +18,8 @@ export const Route = createRootRoute({
  */
 function useIsSignInRoute(): boolean {
   return useRouterState({
-    select: (s) => s.location.pathname.startsWith('/signin'),
+    select: (s) =>
+      s.location.pathname === '/signin' || s.location.pathname.startsWith('/signin/'),
   });
 }
 

@@ -16,9 +16,9 @@ namespace Korat.Auth.Tests;
 ///
 /// Covers four contracts:
 /// (a) New user whose email == Bootstrap:AdminEmail is provisioned as admin without an invite.
-/// (b) New user whose email != Bootstrap:AdminEmail still requires an invite.
-/// (c) Existing non-admin user signing in with the admin email gets promoted (idempotent).
-/// (d) Feature is off when Bootstrap:AdminEmail is unset — normal invite flow for everyone.
+/// (b) New user whose email != Bootstrap:AdminEmail is provisioned without admin rights.
+/// (c) Existing non-admin user with a verified admin email gets promoted (idempotent).
+/// (d) Feature is off when Bootstrap:AdminEmail is unset — no automatic promotion.
 /// </summary>
 public class AdminEmailBootstrapTests
 {
@@ -233,6 +233,120 @@ public class AdminEmailBootstrapTests
 
         var user = await sut.Db.Users.SingleAsync(u => u.Id == userId);
         Assert.True(user.IsAdmin);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ReturningProviderIdentity_AdminPromotionRequiresCurrentEmailVerification(bool emailVerified)
+    {
+        var sut = Build("admin@example.com");
+        var originalRequest = new CanonicalSigninRequest(
+            LoginProvider.Google, "stable-google-subject", "member@example.com", true, "Member", "/app/");
+        await sut.Handler.CompleteAsync(FakeHttpContext(), originalRequest, default);
+        var originalUser = await sut.Db.Users.SingleAsync();
+        Assert.False(originalUser.IsAdmin);
+
+        var result = await sut.Handler.CompleteAsync(FakeHttpContext(), originalRequest with
+        {
+            Email = "  Admin@Example.COM ",
+            EmailVerified = emailVerified,
+        }, default);
+
+        var user = await sut.Db.Users.SingleAsync();
+        Assert.Equal(originalUser.Id, user.Id);
+        Assert.Equal(emailVerified, user.IsAdmin);
+        Assert.Equal("member@example.com", user.PrimaryEmail);
+        // The stable subject may still sign in; an unverified email only blocks elevation.
+        Assert.Equal(2, await sut.Db.AuthSessions.CountAsync());
+        Assert.Equal("/app/", Assert.IsType<Microsoft.AspNetCore.Http.HttpResults.RedirectHttpResult>(result).Url);
+    }
+
+    [Fact]
+    public async Task NewIdentity_UnverifiedAdminEmail_CannotBootstrapAccount()
+    {
+        var sut = Build("admin@example.com");
+        var request = MakeRequest("admin@example.com") with { EmailVerified = false };
+        var result = await sut.Handler.CompleteAsync(FakeHttpContext(), request, default);
+
+        Assert.Empty(sut.Db.Users);
+        Assert.Empty(sut.Db.AuthSessions);
+        Assert.Equal("/app/signin?error=unverified_email",
+            Assert.IsType<Microsoft.AspNetCore.Http.HttpResults.RedirectHttpResult>(result).Url);
+    }
+
+    [Fact]
+    public async Task ExistingExternalLogin_ForSuspendedUser_DoesNotCreateSession()
+    {
+        var sut = Build(adminEmail: null);
+        var now = DateTimeOffset.UtcNow;
+        var userId = UserId.New();
+        const string providerUserId = "suspended-provider-id";
+
+        sut.Db.Users.Add(new User
+        {
+            Id = userId,
+            PrimaryEmail = "suspended@example.com",
+            DisplayName = "Suspended User",
+            CreatedAt = now,
+            Status = UserStatus.Suspended,
+            IsAdmin = false,
+        });
+        sut.Db.ExternalLogins.Add(new ExternalLogin
+        {
+            Id = Guid.NewGuid(),
+            UserId = userId,
+            Provider = LoginProvider.MagicLink,
+            ProviderUserId = providerUserId,
+            EmailAtLink = "suspended@example.com",
+            EmailVerified = true,
+            LinkedAt = now,
+        });
+        await sut.Db.SaveChangesAsync();
+
+        var result = await sut.Handler.CompleteAsync(FakeHttpContext(), new CanonicalSigninRequest(
+            Provider: LoginProvider.MagicLink,
+            ProviderUserId: providerUserId,
+            Email: "suspended@example.com",
+            EmailVerified: true,
+            DisplayName: null,
+            ReturnUrl: "/app/"), default);
+
+        Assert.Empty(sut.Db.AuthSessions);
+        Assert.Single(sut.Db.Users);
+        var redirect = Assert.IsType<Microsoft.AspNetCore.Http.HttpResults.RedirectHttpResult>(result);
+        Assert.Equal("/app/signin?error=signin_failed", redirect.Url);
+    }
+
+    [Fact]
+    public async Task NewProviderIdentity_ForSuspendedEmail_DoesNotCreateOrLinkAccount()
+    {
+        var sut = Build(adminEmail: null);
+        var userId = UserId.New();
+        sut.Db.Users.Add(new User
+        {
+            Id = userId,
+            PrimaryEmail = "suspended-new-provider@example.com",
+            DisplayName = "Suspended User",
+            CreatedAt = DateTimeOffset.UtcNow,
+            Status = UserStatus.Suspended,
+            IsAdmin = false,
+        });
+        await sut.Db.SaveChangesAsync();
+
+        var result = await sut.Handler.CompleteAsync(FakeHttpContext(), new CanonicalSigninRequest(
+            Provider: LoginProvider.GitHub,
+            ProviderUserId: "new-provider-identity",
+            Email: "suspended-new-provider@example.com",
+            EmailVerified: true,
+            DisplayName: null,
+            ReturnUrl: "/app/"), default);
+
+        Assert.Single(sut.Db.Users);
+        Assert.Empty(sut.Db.ExternalLogins);
+        Assert.Empty(sut.Db.AuthSessions);
+        var redirect = Assert.IsType<Microsoft.AspNetCore.Http.HttpResults.RedirectHttpResult>(result);
+        Assert.Equal("/app/signin?error=signin_failed", redirect.Url);
     }
 
     // ── (d) feature off when Bootstrap:AdminEmail unset — account yes, admin no ──
