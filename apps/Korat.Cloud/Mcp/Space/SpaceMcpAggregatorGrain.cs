@@ -35,7 +35,8 @@ namespace Korat.Cloud.Mcp.Space;
 /// routes to its backend and the response is reframed under the external client's own id
 /// (<see cref="HandleToolRouteAsync"/>); a <c>request-access__&lt;slug&gt;</c> call creates an
 /// access request (<see cref="HandleRequestAccessRouteAsync"/>, N1: catches the
-/// already-granted race). Any other method is <c>-32601</c>.
+/// already-granted race). Resource/prompt catalogs, content requests, completions, and
+/// subscriptions live in the Content partial. Unsupported methods return <c>-32601</c>.
 ///
 /// <see cref="OnDeliveryAsync"/> (B1 plan-review correction, wired from Task 3's
 /// <see cref="CallbackServerStreamWriter"/>): demuxes a delivered frame to the owning
@@ -45,7 +46,7 @@ namespace Korat.Cloud.Mcp.Space;
 /// grain-state mutation happens here, on the scheduler.
 /// </summary>
 [Reentrant]
-public sealed class SpaceMcpAggregatorGrain(
+public sealed partial class SpaceMcpAggregatorGrain(
     ISessionAdmission admission,
     SessionRoutingTable routingTable,
     IClusterClient clusterClient,
@@ -306,6 +307,7 @@ public sealed class SpaceMcpAggregatorGrain(
         // ungranted set actually moved since this initial snapshot, not unconditionally.
         _ungrantedServerIds = ungrantedServers.Select(s => s.Id).ToHashSet();
         _announcedToolsListJson = _catalog.ToolsListJson();
+        RememberContentSnapshot();
 
         var protocolVersion = ExtractEchoProtocolVersion(clientInitializeJson);
         _cachedInitializeResultJson = BuildInitializeResultJson(protocolVersion);
@@ -468,6 +470,7 @@ public sealed class SpaceMcpAggregatorGrain(
         var slug = ReserveSlug(server);
         var backend = new SpaceBackendSession(
             routingTable, SessionAdmission.AggregatorSentinelNodeId, server.Id.Value, slug, opened.SessionId.Value);
+        backend.Notification += (method, parameters) => OnBackendNotification(backend, method, parameters);
 
         // Index by relay SessionId BEFORE the handshake — OnDeliveryAsync demuxes the backend's
         // OWN "initialize"/"tools/list" replies by looking this table up by SessionId. Indexing
@@ -480,6 +483,7 @@ public sealed class SpaceMcpAggregatorGrain(
         {
             await backend.InitializeAsync(ct);
             var tools = await backend.ListToolsAsync(ct);
+            await backend.ListContentAsync(ct);
             // MUST-FIX F1 checkpoint (b) + N-b (adversarial review): re-check BOTH _tornDown and
             // IsAlive AFTER the handshake awaits return.
             //   - _tornDown: a concurrent TerminateAsync ran to completion WHILE we awaited the
@@ -498,7 +502,7 @@ public sealed class SpaceMcpAggregatorGrain(
             // tearing down itself", which is false in the teardown-race case), and it closes the
             // gap where the relay session is still genuinely open but this activation is already
             // gone.
-            if (_tornDown || !backend.IsAlive)
+            if (_tornDown || !backend.IsAlive || !await IsServerGrantedAsync(backend.ServerId, ct))
             {
                 if (!backend.IsAlive)
                     logger.LogInformation(
@@ -520,7 +524,9 @@ public sealed class SpaceMcpAggregatorGrain(
                 return;
             }
             _backendsBySlug[slug] = backend;
+            _content.SetServer(server.Id.Value, slug, backend.Resources, backend.ResourceTemplates, backend.Prompts);
             _catalog.SetGranted(server.Id.Value, slug, server.DisplayName, tools);
+            StartRestoreSubscriptions(backend);
         }
         catch (Exception ex)
         {
@@ -656,11 +662,12 @@ public sealed class SpaceMcpAggregatorGrain(
 
         // (a) Newly granted servers that have never produced a catalog — open them via the SAME
         // bounded-concurrency path InitializeCoreAsync's own fan-out uses. A temporarily offline
-        // server WITH a cached catalog is intentionally excluded: timer-driven reconnects would
-        // burn silent-push budget even when nobody is trying to use the tool. Its first call owns
-        // the wake/reopen instead.
+        // server WITH a cached catalog is excluded unless it has active resource subscriptions:
+        // those explicitly request a continuing watch. Otherwise the first call owns the
+        // wake/reopen instead of spending silent-push budget while nobody is using the server.
         var toOpen = grantedServers
-            .Where(s => !openServerIds.Contains(s.Id.Value) && !_catalog.HasGrantedServer(s.Id.Value))
+            .Where(s => !openServerIds.Contains(s.Id.Value)
+                && (!_catalog.HasGrantedServer(s.Id.Value) || _subscriptions.Keys.Any(k => k.ServerId == s.Id.Value)))
             .ToList();
         if (toOpen.Count > 0)
         {
@@ -709,6 +716,7 @@ public sealed class SpaceMcpAggregatorGrain(
                 _backendsBySessionId.Remove(backend.SessionId);
                 ReleaseReservedSlug(backend.ServerId);
                 _catalog.RemoveGranted(backend.ServerId);
+                RemoveContent(backend.ServerId);
                 backend.OnClosed("no longer granted (reconcile backstop)");
                 changed = true;
             }
@@ -727,6 +735,12 @@ public sealed class SpaceMcpAggregatorGrain(
         }
         if (_catalog.RemoveGrantedExcept(grantedServerIds))
             changed = true;
+        _content.RemoveExcept(grantedServerIds);
+        foreach (var serverId in _subscriptions.Keys.Select(k => k.ServerId).Distinct().ToArray())
+            if (!grantedServerIds.Contains(serverId)) RemoveContent(serverId);
+
+        await RefreshDirtyCatalogsAsync(ct);
+        foreach (var backend in _backendsBySlug.Values.ToArray()) StartRestoreSubscriptions(backend);
 
         // (c) Ungranted-stub set changed — refresh the request-access catalog entries. Diffed
         // against _ungrantedServerIds (not unconditionally rebuilt) so a tick where nothing about
@@ -754,6 +768,8 @@ public sealed class SpaceMcpAggregatorGrain(
 
         if (changed)
             BumpListChanged();
+        else
+            AnnounceContentChanges();
     }
 
     public async Task<string?> DispatchAsync(string jsonRpc)
@@ -789,6 +805,17 @@ public sealed class SpaceMcpAggregatorGrain(
             if (msg.IsResponse)
                 return null;
 
+            if (_tornDown || !_initialized)
+                return JsonRpcMessage.Error(msg.Id, -32002, "not initialized");
+
+            if (msg.Method is "resources/list" or "resources/templates/list" or "prompts/list" or "tools/list")
+            {
+                if (msg.Params?["cursor"] is not null)
+                    return JsonRpcMessage.Error(msg.Id, -32602, "This catalog has no continuation cursor.");
+                await PruneUnauthorizedContentAsync();
+                await RefreshDirtyCatalogsAsync(CancellationToken.None);
+            }
+
             return msg.Method switch
             {
                 "tools/list" => JsonRpcMessage.Result(msg.Id, _catalog.ToolsListJson()),
@@ -796,6 +823,12 @@ public sealed class SpaceMcpAggregatorGrain(
                 // SAME session (e.g. another tools/call, or OnDeliveryAsync demuxing a DIFFERENT
                 // backend's frame) — the grain is [Reentrant].
                 "tools/call" => await HandleToolCallAsync(msg),
+                "ping" => JsonRpcMessage.Result(msg.Id, "{}"),
+                "resources/list" => JsonRpcMessage.Result(msg.Id, _content.ResourcesListJson()),
+                "resources/templates/list" => JsonRpcMessage.Result(msg.Id, _content.ResourceTemplatesListJson()),
+                "prompts/list" => JsonRpcMessage.Result(msg.Id, _content.PromptsListJson()),
+                "resources/read" or "prompts/get" or "completion/complete" => await HandleContentAsync(msg),
+                "resources/subscribe" or "resources/unsubscribe" => await HandleSubscriptionAsync(msg),
                 _ => JsonRpcMessage.Error(msg.Id, -32601, "Method not found."),
             };
         }
@@ -843,10 +876,9 @@ public sealed class SpaceMcpAggregatorGrain(
         if (route.ServerId is null || route.OriginalName is null)
             return JsonRpcMessage.Error(msg.Id, -32000, "Server unavailable.");
 
-        // The catalog survives temporary relay loss. If there is no live backend, this call
-        // revalidates the route and enters shared admission, including APNs wake for mobile.
-        var backend = FindLiveBackend(route.ServerId)
-            ?? await OpenBackendForToolCallAsync(route.ServerId);
+        // Validate this route's current grant even while its backend is live. If the relay is
+        // down, enter shared admission (including APNs wake) without scanning unrelated servers.
+        var backend = await OpenBackendForToolCallAsync(route.ServerId);
         if (backend is null)
             return JsonRpcMessage.Error(msg.Id, -32000, "Server unavailable.");
 
@@ -901,6 +933,9 @@ public sealed class SpaceMcpAggregatorGrain(
             return JsonRpcMessage.Error(msg.Id, -32000, "Server unavailable.");
         }
 
+        if (_tornDown || !backend.IsAlive || !await IsServerGrantedAsync(route.ServerId, CancellationToken.None))
+            return JsonRpcMessage.Error(msg.Id, -32000, "Server unavailable.");
+
         JsonObject backendJson;
         try
         {
@@ -918,18 +953,18 @@ public sealed class SpaceMcpAggregatorGrain(
             // throws in that case. Guard with `as JsonValue` + TryGetValue defaulting to -32603.
             var code = err["code"] is JsonValue codeValue && codeValue.TryGetValue<int>(out var c) ? c : -32603;
             var message = err["message"]?.GetValue<string>() ?? "backend error";
-            return JsonRpcMessage.Error(msg.Id, code, message);
+            return JsonRpcMessage.Error(msg.Id, code, message, err["data"]);
         }
 
-        if (backendJson["result"] is JsonNode result)
-            return JsonRpcMessage.Result(msg.Id, result.ToJsonString());
+        if (backendJson["result"] is JsonObject result)
+            return JsonRpcMessage.Result(msg.Id, McpContentCatalog.RewriteResult(route.ServerId, result).ToJsonString());
 
         return JsonRpcMessage.Error(msg.Id, -32603, "malformed backend response");
     }
 
     /// <summary>
-    /// Revalidates a cached route against the current Published/grant snapshot and lazily opens
-    /// its backend. Shared admission remains the final fail-closed authority and repeats grant,
+    /// Revalidates only the addressed server's publication, Space, grant and definition digest,
+    /// then lazily opens its backend. Shared admission repeats grant,
     /// server-assertion, and node-status checks after any wake wait.
     /// </summary>
     private async Task<SpaceBackendSession?> OpenBackendForToolCallAsync(string serverId)
@@ -937,38 +972,43 @@ public sealed class SpaceMcpAggregatorGrain(
         if (_tornDown)
             return null;
 
-        var existing = FindLiveBackend(serverId);
-        if (existing is not null)
-            return existing;
-
-        IReadOnlyList<BackendServer> servers;
         try
         {
             using var cts = new CancellationTokenSource(PerBackendTimeout);
-            servers = await SpaceServerDiscovery.DiscoverAsync(
-                clusterClient, repository, _spaceId, _consumerIdentity, cts.Token);
+            var server = await GetGrantedServerAsync(serverId, cts.Token);
 
             if (_tornDown)
                 return null;
 
-            var server = servers.FirstOrDefault(s => s.Id.Value == serverId && s.Granted);
             if (server is null)
             {
                 // The cached route is no longer authorized/published. Remove it immediately
                 // rather than waiting for reconcile; no admission or backend call is attempted.
                 ReleaseReservedSlug(serverId);
+                RemoveContent(serverId);
                 if (_catalog.RemoveGranted(serverId))
                     BumpListChanged();
+                if (FindLiveBackend(serverId) is { } unauthorized)
+                {
+                    unauthorized.OnClosed("no longer granted");
+                    EvictDeadBackendLocal(unauthorized);
+                }
                 return null;
             }
 
+            var existing = FindLiveBackend(serverId);
+            if (existing is not null)
+                return existing;
+
             var ctx = new SpaceMcpSessionContext(_consumerIdentity, _spaceId, _owner);
-            var backend = await EnsureBackendOpenAsync(server, ctx, cts.Token);
+            var descriptor = new BackendServer(server.Id, server.DisplayName, server.IsAsserted, Granted: true);
+            var backend = await EnsureBackendOpenAsync(descriptor, ctx, cts.Token);
             if (backend is not null
                 && !string.Equals(_catalog.ToolsListJson(), _announcedToolsListJson, StringComparison.Ordinal))
             {
                 BumpListChanged();
             }
+            AnnounceContentChanges();
             return backend;
         }
         catch (Exception ex)
@@ -1060,6 +1100,8 @@ public sealed class SpaceMcpAggregatorGrain(
     private void BumpListChanged()
     {
         _announcedToolsListJson = _catalog.ToolsListJson();
+        PublishNotification("notifications/tools/list_changed");
+        AnnounceContentChanges();
         _listChangedCursor++;
         var old = _cursorBump;
         _cursorBump = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -1136,6 +1178,10 @@ public sealed class SpaceMcpAggregatorGrain(
         _backendsBySlug.Clear();
         _takenSlugs.Clear(); // N-d: this activation is fully torn down — no live backends remain.
         _reservedSlugsByServerId.Clear();
+        _content.Clear();
+        _subscriptions.Clear();
+        _pendingSubscriptions.Clear();
+        _notifications.Clear();
 
         if (_initialized)
         {
@@ -1280,6 +1326,7 @@ public sealed class SpaceMcpAggregatorGrain(
             if (ShouldInvalidateCatalog(closeReason))
             {
                 ReleaseReservedSlug(backend.ServerId);
+                RemoveContent(backend.ServerId);
                 if (_catalog.RemoveGranted(backend.ServerId))
                     BumpListChanged();
             }
@@ -1386,7 +1433,14 @@ public sealed class SpaceMcpAggregatorGrain(
     private static string BuildInitializeResultJson(string protocolVersion) => new JsonObject
     {
         ["protocolVersion"] = protocolVersion,
-        ["capabilities"] = new JsonObject { ["tools"] = new JsonObject { ["listChanged"] = true } },
+        ["capabilities"] = new JsonObject
+        {
+            ["tools"] = new JsonObject { ["listChanged"] = true },
+            ["resources"] = new JsonObject { ["listChanged"] = true, ["subscribe"] = true },
+            ["prompts"] = new JsonObject { ["listChanged"] = true },
+            ["completions"] = new JsonObject(),
+        },
         ["serverInfo"] = new JsonObject { ["name"] = "korat-space", ["version"] = "1" },
+        ["instructions"] = "Read korat://help/usage or use the korat-guide prompt for discovery, server namespaces, and access requests.",
     }.ToJsonString();
 }

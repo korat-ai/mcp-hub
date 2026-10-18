@@ -64,9 +64,11 @@ internal sealed class OAuthFacadeRewritingHandler(HttpClient passthrough) : Http
             var rewrittenUri = new UriBuilder(request.RequestUri) { Scheme = real.Scheme, Host = real.Host, Port = real.Port }.Uri;
             var forward = CloneForResend(request);
             forward.RequestUri = rewrittenUri;
-            return await DirectLoopbackClient.SendAsync(forward, ct);
+            return await DirectLoopbackClient.SendAsync(forward, HttpCompletionOption.ResponseHeadersRead, ct);
         }
-        return await passthrough.SendAsync(CloneForResend(request), ct);
+        // Preserve streaming at the transport boundary: buffering here prevents a live MCP
+        // GET SSE stream from ever reaching HttpMcpClient, regardless of its completion option.
+        return await passthrough.SendAsync(CloneForResend(request), HttpCompletionOption.ResponseHeadersRead, ct);
     }
 
     /// <summary>

@@ -489,6 +489,7 @@ public sealed class KoratIntegrationFixture : IAsyncLifetime
             // ISpaceMcpConsumerSessionsGrain.RegisterAsync — nothing else in this fixture's
             // behavior changes.
             siloBuilder.AddIncomingGrainCallFilter<SpaceMcpConsumerSessionsFaultInjector.Filter>();
+            siloBuilder.AddIncomingGrainCallFilter<SpaceMcpDiscoveryProbe.Filter>();
             siloBuilder.ConfigureServices(services =>
             {
                 services.AddSerializer(serializerBuilder =>

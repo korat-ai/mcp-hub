@@ -159,6 +159,22 @@ The Space-MCP endpoint presents multiple approved backend servers behind one
 MCP connection. Its consumer is a durable, server-minted identity. Backend
 sessions are cloud-terminated and cannot use runtime-to-runtime E2E.
 
+The aggregator negotiates backend capabilities before discovery, so a
+resource-only or prompt-only server does not need to implement tools. Backend
+catalog pages are collected with size/page limits. Resource URIs and prompt
+names identify their source server; requests are routed only to an approved
+server in the session's Space. A read never makes the Cloud fetch an arbitrary
+URI. Permissions are checked again before returning content received after an
+await, including after a permission or server-definition change.
+
+`McpContentCatalog` preserves resource/template/prompt metadata and namespaces
+MCP-managed resource links in results, leaving direct HTTP/HTTPS links unchanged.
+`SpaceBackendSession` handles
+upstream discovery and notifications. The session grain coalesces catalog
+invalidations and subscribed-resource updates; the HTTP dispatcher carries
+them over its GET SSE stream. Subscriptions belong to one MCP session, not to
+the whole Space. [MCP content](../mcp-content.md) documents the client contract.
+
 ## Relay routing and confidentiality
 
 `SessionRoutingTable` owns writers for streams connected to one Cloud instance.

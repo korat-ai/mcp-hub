@@ -71,6 +71,7 @@ public class ConsumerDeliveryLegTests
         public Task<string> InitializeAsync(SpaceMcpSessionContext ctx, string clientInitializeJson) => throw new NotSupportedException();
         public Task<string?> DispatchAsync(string jsonRpc) => throw new NotSupportedException();
         public Task<long> NextListChangedAsync(long knownCursor) => throw new NotSupportedException();
+        public Task<SpaceMcpNotifications> NextNotificationsAsync(long knownCursor, CancellationToken cancellationToken = default) => throw new NotSupportedException();
         public Task TerminateAsync() => throw new NotSupportedException();
         public Task<SpaceMcpBinding?> GetBindingAsync() => throw new NotSupportedException();
     }

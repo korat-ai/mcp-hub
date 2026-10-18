@@ -21,6 +21,8 @@ this index, then pick the document that matches what you are about to do.
 
 ## Product framing (read once, then refer back)
 
+- **[mcp-content.md](mcp-content.md)** — aggregated tools, resources, prompts,
+  namespaces, notifications, and built-in usage guidance.
 - **[product-brief.md](product-brief.md)** — what Korat is, who it is for, and the "Tailscale for MCP" metaphor.
 - **[public-roadmap.md](public-roadmap.md)** — directional future roadmap;
   optional agent/channel work is not part of the default MCP relay surface.
@@ -33,9 +35,6 @@ this index, then pick the document that matches what you are about to do.
 
 ## Operations
 
-- **deployment-fly.md** — reference Fly.io deployment
-  topology. Replace example app names and domains with values owned by your
-  deployment, and review every secret before use.
 - **[../SECURITY.md](../SECURITY.md)** — supported reporting path and the
   security boundaries maintainers should preserve.
 

@@ -55,6 +55,40 @@ public sealed class HttpMcpProxyGrainOAuthTests(KoratIntegrationFixture fixture)
     private const int EgressConcurrencyCeiling = 8;
 
     [Fact]
+    public async Task StandaloneGet401_RefreshesOnce_ThenDeliversNotificationWithNewToken()
+    {
+        var gets = 0;
+        using var stub = await StartStubAsync((_, method, id) => method == "notifications/initialized"
+            ? (202, null)
+            : (200, """{"jsonrpc":"2.0","id":__ID__,"result":{"protocolVersion":"2025-06-18","capabilities":{"resources":{"subscribe":true}}}}""".Replace("__ID__", id)),
+            getResponder: async ctx =>
+            {
+                Interlocked.Increment(ref gets);
+                if (ctx.Request.Headers.Authorization == "Bearer at-stale") { ctx.Response.StatusCode = 401; return; }
+                Assert.Equal("Bearer at-refreshed", ctx.Request.Headers.Authorization.ToString());
+                ctx.Response.ContentType = "text/event-stream";
+                await ctx.Response.WriteAsync("data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/resources/list_changed\"}\n\n");
+                await ctx.Response.Body.FlushAsync();
+                try { await Task.Delay(Timeout.InfiniteTimeSpan, ctx.RequestAborted); }
+                catch (OperationCanceledException) { }
+            });
+        var (server, sessionId, connectionId, writer) = await SetUpOAuthConsumerSessionAsync(
+            stub.Url, "at-stale", "rt-live", DateTimeOffset.UtcNow.AddHours(1), $"{stub.Url}/token", "client-1", null);
+        var proxy = fixture.ClusterClient.GetGrain<IHttpMcpProxyGrain>(server.Id.Value);
+        try
+        {
+            await proxy.DispatchFrameAsync(Encoding.UTF8.GetBytes("""{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"""), connectionId, sessionId, default);
+            await writer.ReadNextAsync(PushTimeout);
+            await proxy.DispatchFrameAsync(Encoding.UTF8.GetBytes("""{"jsonrpc":"2.0","method":"notifications/initialized"}"""), connectionId, sessionId, default);
+            var notification = await writer.ReadNextAsync(PushTimeout);
+            Assert.Equal("notifications/resources/list_changed", JsonSerializer.Deserialize<JsonElement>(notification.Frame.Ciphertext.ToByteArray()).GetProperty("method").GetString());
+            Assert.Equal(2, gets);
+            Assert.Equal(1, stub.TokenCallCount);
+        }
+        finally { await proxy.CloseConsumerSessionAsync(sessionId); }
+    }
+
+    [Fact]
     public async Task DispatchFrameAsync_InjectsStoredAccessToken_AsBearerHeader()
     {
         string? observedAuth = null;
@@ -591,13 +625,16 @@ public sealed class HttpMcpProxyGrainOAuthTests(KoratIntegrationFixture fixture)
     private async Task<StubServer> StartStubAsync(
         Func<HttpContext, string?, string, (int StatusCode, string? Body)> mcpResponder,
         string refreshedAccessToken = "at-refreshed",
-        TokenEndpointBehavior tokenEndpointBehavior = TokenEndpointBehavior.Success)
+        TokenEndpointBehavior tokenEndpointBehavior = TokenEndpointBehavior.Success,
+        Func<HttpContext, Task>? getResponder = null)
     {
         var builder = WebApplication.CreateBuilder();
         builder.WebHost.UseUrls("http://127.0.0.1:0");
         builder.Environment.EnvironmentName = "Testing";
         var app = builder.Build();
         var tokenCallCount = 0;
+
+        if (getResponder is not null) app.MapGet("/mcp", getResponder);
 
         app.MapPost("/mcp", async (HttpContext ctx) =>
         {

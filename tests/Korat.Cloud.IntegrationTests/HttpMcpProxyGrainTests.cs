@@ -1,4 +1,5 @@
 using System.Net.Http.Json;
+using System.Reflection;
 using System.Text;
 using System.Text.Json;
 using System.Threading.Channels;
@@ -31,6 +32,288 @@ namespace Korat.Cloud.IntegrationTests;
 public sealed class HttpMcpProxyGrainTests(KoratIntegrationFixture fixture) : IClassFixture<KoratIntegrationFixture>
 {
     private static readonly TimeSpan PushTimeout = TimeSpan.FromSeconds(10);
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task QuietGet_SurvivesIdleCollection_ThenLastCloseOrEvictReleasesActivation(bool evict)
+    {
+        var connected = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var secondConnected = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var siblingDisconnected = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var emit = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var disconnected = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var gets = 0;
+        var disconnects = 0;
+        using var stub = await StartStubMcpServerAsync(async ctx =>
+        {
+            var request = await JsonSerializer.DeserializeAsync<JsonElement>(ctx.Request.Body);
+            if (!request.TryGetProperty("id", out _)) { ctx.Response.StatusCode = 202; return; }
+            ctx.Response.ContentType = "application/json";
+            await ctx.Response.WriteAsync("""{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{"resources":{"subscribe":true}}}}""");
+        }, async ctx =>
+        {
+            ctx.Response.ContentType = "text/event-stream";
+            await ctx.Response.StartAsync();
+            connected.TrySetResult();
+            if (Interlocked.Increment(ref gets) == 2) secondConnected.TrySetResult();
+            try
+            {
+                await emit.Task.WaitAsync(ctx.RequestAborted);
+                await ctx.Response.WriteAsync("data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/resources/updated\",\"params\":{\"uri\":\"test://still-live\"}}\n\n");
+                await ctx.Response.Body.FlushAsync();
+                await Task.Delay(Timeout.InfiniteTimeSpan, ctx.RequestAborted);
+            }
+            catch (OperationCanceledException)
+            {
+                siblingDisconnected.TrySetResult();
+                if (Interlocked.Increment(ref disconnects) == 2) disconnected.TrySetResult();
+            }
+        });
+        var (server, session, connection, writer) = await SetUpConsumerSessionAsync(stub.Url, McpServerAuthModes.None, null);
+        var proxy = fixture.ClusterClient.GetGrain<IHttpMcpProxyGrain>(server.Id.Value);
+        var sibling = await OpenConsumerConnectionAsync(server);
+        try
+        {
+            await proxy.DispatchFrameAsync(Encoding.UTF8.GetBytes("""{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"""), connection, session, default);
+            await writer.ReadNextAsync(PushTimeout);
+            await proxy.DispatchFrameAsync(Encoding.UTF8.GetBytes("""{"jsonrpc":"2.0","method":"notifications/initialized"}"""), connection, session, default);
+            await connected.Task.WaitAsync(PushTimeout);
+
+            await proxy.DispatchFrameAsync(Encoding.UTF8.GetBytes("""{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"""), sibling.ConnectionId, sibling.SessionId, default);
+            await sibling.Writer.ReadNextAsync(PushTimeout);
+            await proxy.DispatchFrameAsync(Encoding.UTF8.GetBytes("""{"jsonrpc":"2.0","method":"notifications/initialized"}"""), sibling.ConnectionId, sibling.SessionId, default);
+            await secondConnected.Task.WaitAsync(PushTimeout);
+            await proxy.CloseConsumerSessionAsync(sibling.SessionId);
+            await siblingDisconnected.Task.WaitAsync(PushTimeout);
+
+            var (context, services) = FindHttpActivation(proxy);
+            // Accelerate only the test's time scale: expire the dispatch grace period and
+            // shorten the real grain timer. No calls to the proxy during the idle window.
+            context.GetType().GetProperty("KeepAliveUntil")!.SetValue(context, DateTime.MinValue);
+            GetConsumerKeepAliveTimer(context)!.Change(TimeSpan.Zero, TimeSpan.FromMilliseconds(50));
+            await Task.Delay(800);
+            await CollectIdleHttpActivations(services);
+
+            Assert.False(context.Deactivated.IsCompleted, "Quiet live GET must not be idle-collected.");
+            Assert.False(disconnected.Task.IsCompleted);
+            emit.TrySetResult();
+            var update = await writer.ReadNextAsync(PushTimeout);
+            Assert.Equal("test://still-live", JsonSerializer.Deserialize<JsonElement>(update.Frame.Ciphertext.ToByteArray())
+                .GetProperty("params").GetProperty("uri").GetString());
+
+            if (evict) await proxy.EvictAsync();
+            else await proxy.CloseConsumerSessionAsync(session);
+            await disconnected.Task.WaitAsync(PushTimeout);
+            await Task.Delay(800);
+            await CollectIdleHttpActivations(services);
+            await context.Deactivated.WaitAsync(PushTimeout);
+        }
+        finally
+        {
+            await proxy.CloseConsumerSessionAsync(session);
+            await proxy.CloseConsumerSessionAsync(sibling.SessionId);
+        }
+    }
+
+    // Runtime inspection avoids adding diagnostic methods to the production grain contract.
+    // Collection is the actual Orleans collector, not a mocked lifecycle callback.
+    private (global::Orleans.Runtime.IGrainContext Context, IServiceProvider Services) FindHttpActivation(IHttpMcpProxyGrain proxy)
+    {
+        var catalogType = Assembly.Load("Orleans.Runtime").GetType("Orleans.Runtime.Catalog", throwOnError: true)!;
+        foreach (var silo in fixture.Cluster.GetActiveSilos())
+        {
+            var services = fixture.Cluster.GetSiloServiceProvider(silo.SiloAddress);
+            var catalog = services.GetRequiredService(catalogType);
+            object?[] args = [proxy.GetGrainId(), null];
+            if ((bool)catalogType.GetMethod("TryGetGrainContext", BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(catalog, args)!)
+                return ((global::Orleans.Runtime.IGrainContext)args[1]!, services);
+        }
+        throw new InvalidOperationException("HTTP proxy activation not found.");
+    }
+
+    private static Task CollectIdleHttpActivations(IServiceProvider services)
+    {
+        var type = Assembly.Load("Orleans.Runtime").GetType("Orleans.Runtime.ActivationCollector", throwOnError: true)!;
+        return (Task)type.GetMethod("CollectActivations")!.Invoke(services.GetRequiredService(type),
+            [TimeSpan.FromMilliseconds(400), CancellationToken.None])!;
+    }
+
+    private static global::Orleans.Runtime.IGrainTimer? GetConsumerKeepAliveTimer(global::Orleans.Runtime.IGrainContext context)
+        => (global::Orleans.Runtime.IGrainTimer?)typeof(Korat.Cloud.Gateways.HttpMcpProxyGrain)
+            .GetField("_consumerKeepAliveTimer", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(context.GrainInstance);
+
+    [Fact]
+    public async Task Initialize_WithoutNotificationCapabilities_DoesNotOpenGet()
+    {
+        var gets = 0;
+        using var stub = await StartStubMcpServerAsync(async ctx =>
+        {
+            var request = await JsonSerializer.DeserializeAsync<JsonElement>(ctx.Request.Body);
+            if (!request.TryGetProperty("id", out var id)) { ctx.Response.StatusCode = 202; return; }
+            ctx.Response.ContentType = "application/json";
+            await ctx.Response.WriteAsync("""{"jsonrpc":"2.0","id":__ID__,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}}}}""".Replace("__ID__", id.GetRawText()));
+        }, ctx => { Interlocked.Increment(ref gets); ctx.Response.StatusCode = 404; return Task.CompletedTask; });
+        var (server, session, connection, writer) = await SetUpConsumerSessionAsync(stub.Url, McpServerAuthModes.None, null);
+        var proxy = fixture.ClusterClient.GetGrain<IHttpMcpProxyGrain>(server.Id.Value);
+        try
+        {
+            await proxy.DispatchFrameAsync(Encoding.UTF8.GetBytes("""{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"""), connection, session, default);
+            await writer.ReadNextAsync(PushTimeout);
+            await proxy.DispatchFrameAsync(Encoding.UTF8.GetBytes("""{"jsonrpc":"2.0","method":"notifications/initialized"}"""), connection, session, default);
+            await proxy.DispatchFrameAsync(Encoding.UTF8.GetBytes("""{"jsonrpc":"2.0","id":2,"method":"tools/list"}"""), connection, session, default);
+            await writer.ReadNextAsync(PushTimeout);
+            await Task.Delay(300);
+            Assert.Equal(0, gets);
+        }
+        finally { await proxy.CloseConsumerSessionAsync(session); }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task GetSse_EofRetriesWithBackoff_ThenDeliversUpdateOrObservableClose(bool recover)
+    {
+        var gets = 0;
+        using var stub = await StartStubMcpServerAsync(async ctx =>
+        {
+            var request = await JsonSerializer.DeserializeAsync<JsonElement>(ctx.Request.Body);
+            if (!request.TryGetProperty("id", out _)) { ctx.Response.StatusCode = 202; return; }
+            ctx.Response.ContentType = "application/json";
+            await ctx.Response.WriteAsync("""{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{"resources":{"subscribe":true}}}}""");
+        }, async ctx =>
+        {
+            var attempt = Interlocked.Increment(ref gets);
+            ctx.Response.ContentType = "text/event-stream";
+            if (attempt == 1 || !recover) { await ctx.Response.StartAsync(); return; }
+            await ctx.Response.WriteAsync("data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/resources/updated\",\"params\":{\"uri\":\"test://recovered\"}}\n\n");
+            await ctx.Response.Body.FlushAsync();
+            try { await Task.Delay(Timeout.InfiniteTimeSpan, ctx.RequestAborted); }
+            catch (OperationCanceledException) { }
+        });
+        var (server, session, connection, writer) = await SetUpConsumerSessionAsync(stub.Url, McpServerAuthModes.None, null);
+        var sessionGrain = fixture.ClusterClient.GetGrain<ISessionGrain>(session.Value);
+        await sessionGrain.OpenAsync(GrantId.New(), ConsumerId.New(), server.Id, NodeId.New(),
+            new NodeId(string.Empty), new GatewayId("test"), server.SpaceId, connection);
+        var proxy = fixture.ClusterClient.GetGrain<IHttpMcpProxyGrain>(server.Id.Value);
+        try
+        {
+            await proxy.DispatchFrameAsync(Encoding.UTF8.GetBytes("""{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"""), connection, session, default);
+            await writer.ReadNextAsync(PushTimeout);
+            var (context, services) = FindHttpActivation(proxy);
+            GetConsumerKeepAliveTimer(context)!.Change(TimeSpan.Zero, TimeSpan.FromMilliseconds(50));
+            await proxy.DispatchFrameAsync(Encoding.UTF8.GetBytes("""{"jsonrpc":"2.0","method":"notifications/initialized"}"""), connection, session, default);
+            var pushed = await writer.ReadNextAsync(TimeSpan.FromSeconds(15));
+            if (recover)
+            {
+                Assert.Equal(2, gets);
+                Assert.Equal("test://recovered", JsonSerializer.Deserialize<JsonElement>(pushed.Frame.Ciphertext.ToByteArray()).GetProperty("params").GetProperty("uri").GetString());
+            }
+            else
+            {
+                Assert.Equal(3, gets);
+                Assert.Equal(GatewayToNodeMessage.PayloadOneofCase.CloseSession, pushed.PayloadCase);
+                Assert.Equal(session.Value, pushed.CloseSession.SessionId);
+                Assert.Equal("upstream_notifications_unavailable", pushed.CloseSession.Reason);
+                using var scope = fixture.Services.CreateScope();
+                var repository = scope.ServiceProvider.GetRequiredService<Korat.Domain.Persistence.IMetadataRepository>();
+                var stored = await repository.GetSessionAsync(session, default);
+                Assert.NotNull(stored);
+                Assert.Equal(SessionStatus.Closed, stored.Status);
+                Assert.Equal(SessionCloseReason.ServerUnavailable, stored.CloseReason);
+                // This removal happens on a detached GET task, not CloseConsumerSessionAsync.
+                // The lifecycle timer must release its own keep-alive and dispatch grace.
+                await Task.Delay(800);
+                Assert.Null(GetConsumerKeepAliveTimer(context));
+                await CollectIdleHttpActivations(services);
+                await context.Deactivated.WaitAsync(PushTimeout);
+            }
+        }
+        finally { await proxy.CloseConsumerSessionAsync(session); }
+    }
+
+    [Fact]
+    public async Task PostSse_InterimNotificationUsesConsumerRelayRoute()
+    {
+        using var stub = await StartStubMcpServerAsync(async ctx =>
+        {
+            var request = await JsonSerializer.DeserializeAsync<JsonElement>(ctx.Request.Body);
+            var method = request.GetProperty("method").GetString();
+            if (method == "notifications/initialized") { ctx.Response.StatusCode = 202; return; }
+            var id = request.GetProperty("id").GetRawText();
+            if (method == "initialize")
+            {
+                ctx.Response.ContentType = "application/json";
+                await ctx.Response.WriteAsync($$$$"""{"jsonrpc":"2.0","id":{{{{id}}}},"result":{"protocolVersion":"2025-06-18","capabilities":{}}}""");
+                return;
+            }
+            ctx.Response.ContentType = "text/event-stream";
+            await ctx.Response.WriteAsync("data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/resources/updated\",\"params\":{\"uri\":\"test://item\"}}\n\n");
+            await ctx.Response.WriteAsync("data: " + $$$"""{"jsonrpc":"2.0","id":{{{id}}},"result":{}}""" + "\n\n");
+        });
+        var (server, session, connection, writer) = await SetUpConsumerSessionAsync(stub.Url, McpServerAuthModes.None, null);
+        var proxy = fixture.ClusterClient.GetGrain<IHttpMcpProxyGrain>(server.Id.Value);
+        try
+        {
+            await proxy.DispatchFrameAsync(Encoding.UTF8.GetBytes("""{"jsonrpc":"2.0","id":7,"method":"resources/read","params":{"uri":"test://item"}}"""), connection, session, default);
+            var notification = await writer.ReadNextAsync(PushTimeout);
+            var json = JsonSerializer.Deserialize<JsonElement>(notification.Frame.Ciphertext.ToByteArray());
+            Assert.Equal("notifications/resources/updated", json.GetProperty("method").GetString());
+            Assert.Equal("test://item", json.GetProperty("params").GetProperty("uri").GetString());
+            var response = await writer.ReadNextAsync(PushTimeout);
+            Assert.Equal(7, JsonSerializer.Deserialize<JsonElement>(response.Frame.Ciphertext.ToByteArray()).GetProperty("id").GetInt32());
+        }
+        finally { await proxy.CloseConsumerSessionAsync(session); }
+    }
+
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    public async Task GetSse_NotificationUsesConsumerRoute_AndCloseOrEvictCancelsStream(bool evict, bool initializedPostFails)
+    {
+        var disconnected = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var gets = 0;
+        string? getAuth = null;
+        string? getVersion = null;
+        using var stub = await StartStubMcpServerAsync(async ctx =>
+        {
+            var request = await JsonSerializer.DeserializeAsync<JsonElement>(ctx.Request.Body);
+            if (request.GetProperty("method").GetString() == "notifications/initialized") { ctx.Response.StatusCode = initializedPostFails ? 500 : 202; return; }
+            ctx.Response.ContentType = "application/json";
+            ctx.Response.Headers["Mcp-Session-Id"] = "private-upstream-session";
+            await ctx.Response.WriteAsync("""{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26","capabilities":{"resources":{"subscribe":true,"listChanged":true}}}}""");
+        }, async ctx =>
+        {
+            Interlocked.Increment(ref gets);
+            getAuth = ctx.Request.Headers.Authorization;
+            getVersion = ctx.Request.Headers["MCP-Protocol-Version"];
+            ctx.Response.ContentType = "text/event-stream";
+            await ctx.Response.WriteAsync("data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/resources/list_changed\"}\n\n");
+            await ctx.Response.Body.FlushAsync();
+            try { await Task.Delay(Timeout.InfiniteTimeSpan, ctx.RequestAborted); }
+            catch (OperationCanceledException) { disconnected.TrySetResult(); }
+        });
+        var (server, session, connection, writer) = await SetUpConsumerSessionAsync(stub.Url, McpServerAuthModes.Bearer, "upstream-token");
+        var proxy = fixture.ClusterClient.GetGrain<IHttpMcpProxyGrain>(server.Id.Value);
+        try
+        {
+            await proxy.DispatchFrameAsync(Encoding.UTF8.GetBytes("""{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}"""), connection, session, default);
+            await writer.ReadNextAsync(PushTimeout);
+            await proxy.DispatchFrameAsync(Encoding.UTF8.GetBytes("""{"jsonrpc":"2.0","method":"notifications/initialized"}"""), connection, session, default);
+            var notification = await writer.ReadNextAsync(PushTimeout);
+            var text = Encoding.UTF8.GetString(notification.Frame.Ciphertext.ToByteArray());
+            Assert.Equal("notifications/resources/list_changed", JsonSerializer.Deserialize<JsonElement>(text).GetProperty("method").GetString());
+            Assert.DoesNotContain("upstream-token", text);
+            Assert.DoesNotContain("private-upstream-session", text);
+            Assert.Equal("Bearer upstream-token", getAuth);
+            Assert.Equal("2025-03-26", getVersion);
+            Assert.Equal(1, gets);
+            if (evict) await proxy.EvictAsync(); else await proxy.CloseConsumerSessionAsync(session);
+            await disconnected.Task.WaitAsync(PushTimeout);
+        }
+        finally { await proxy.CloseConsumerSessionAsync(session); }
+    }
 
     /// <summary>
     /// Finding 16, B2: the NORMAL path — a real consumer-shaped handshake. The stub's "initialize"
@@ -827,13 +1110,14 @@ public sealed class HttpMcpProxyGrainTests(KoratIntegrationFixture fixture) : IC
         return (server, sessionId, connectionId, writer);
     }
 
-    private static async Task<StubMcpServer> StartStubMcpServerAsync(Func<HttpContext, Task> handler)
+    private static async Task<StubMcpServer> StartStubMcpServerAsync(Func<HttpContext, Task> handler, Func<HttpContext, Task>? getHandler = null)
     {
         var builder = WebApplication.CreateBuilder();
         builder.WebHost.UseUrls("http://127.0.0.1:0");
         builder.Environment.EnvironmentName = "Testing";
         var app = builder.Build();
         app.MapPost("/", handler);
+        if (getHandler is not null) app.MapGet("/", getHandler);
         await app.StartAsync();
         var url = app.Urls.First();
         return new StubMcpServer(app, url);

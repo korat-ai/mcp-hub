@@ -51,7 +51,7 @@ public sealed class JsonRpcMessage
         return o.ToJsonString();
     }
 
-    public static string Error(JsonNode? idNode, int code, string message)
+    public static string Error(JsonNode? idNode, int code, string message, JsonNode? data = null)
     {
         var o = new JsonObject
         {
@@ -59,6 +59,7 @@ public sealed class JsonRpcMessage
             ["id"] = idNode?.DeepClone(),
             ["error"] = new JsonObject { ["code"] = code, ["message"] = message },
         };
+        if (data is not null) o["error"]!["data"] = data.DeepClone();
         return o.ToJsonString();
     }
 

@@ -22,6 +22,7 @@ internal sealed class FakeMcpPublisher : IAsyncDisposable
     private readonly AsyncDuplexStreamingCall<NodeToGatewayMessage, GatewayToNodeMessage> _call;
     private readonly Task _pumpTask;
     private readonly CancellationTokenSource _cts = new();
+    private readonly SemaphoreSlim _writeGate = new(1, 1);
     private readonly ConcurrentDictionary<string, StringBuilder> _buffers = new();
     private readonly ConcurrentQueue<(string SessionId, string Reason)> _closeSessions = new();
     private long _seq;
@@ -63,6 +64,14 @@ internal sealed class FakeMcpPublisher : IAsyncDisposable
     /// <summary>Task 6: optional "tools/call" responder — (toolName, argumentsJson) -> resultJson.
     /// Defaults to a fixed echo-style success result when unset.</summary>
     public Func<string, JsonObject?, string>? ToolCallHandler { get; set; }
+
+    public JsonObject Capabilities { get; set; } = new() { ["tools"] = new JsonObject() };
+    // Return an envelope containing result or error; the fake supplies the request id.
+    public Func<string, JsonObject?, JsonObject?>? RequestHandler { get; set; }
+    public Func<string, JsonObject?, Task<JsonObject?>>? AsyncRequestHandler { get; set; }
+    // A test may hold a reply without blocking this publisher's request-reading loop.
+    public Func<string, JsonObject, bool>? HoldRequest { get; set; }
+    public bool ResourceUpdateWithSubscribeReply { get; set; }
 
     /// <summary>MUST-FIX 1 test support (adversarial review, third pass): artificial delay applied
     /// before answering "tools/call" — simulates a legitimately slow backend operation (build/
@@ -175,12 +184,29 @@ internal sealed class FakeMcpPublisher : IAsyncDisposable
         var json = JsonNode.Parse(line)!.AsObject();
         var method = json["method"]?.GetValue<string>();
         var id = json["id"];
+        if (HoldRequest?.Invoke(sessionId, json) == true) return;
+
+        var handled = method is not null && AsyncRequestHandler is not null
+            ? await AsyncRequestHandler(method, json["params"] as JsonObject) : null;
+        handled ??= method is not null ? RequestHandler?.Invoke(method, json["params"] as JsonObject) : null;
+        if (handled is not null)
+        {
+            handled["jsonrpc"] = "2.0";
+            handled["id"] = id?.DeepClone();
+            var payload = handled.ToJsonString() + "\n";
+            if (method == "resources/subscribe" && ResourceUpdateWithSubscribeReply)
+                payload += new JsonObject { ["jsonrpc"] = "2.0", ["method"] = "notifications/resources/updated",
+                    ["params"] = new JsonObject { ["uri"] = json["params"]?["uri"]?.DeepClone() } }.ToJsonString() + "\n";
+            await SendRawFrameAsync(sessionId, Encoding.UTF8.GetBytes(payload), 0);
+            return;
+        }
 
         switch (method)
         {
             case "initialize":
                 await ReplyAsync(sessionId, id,
-                    """{"protocolVersion":"2025-06-18","capabilities":{},"serverInfo":{"name":"fake-publisher","version":"1"}}""",
+                    new JsonObject { ["protocolVersion"] = "2025-06-18", ["capabilities"] = Capabilities.DeepClone(),
+                        ["serverInfo"] = new JsonObject { ["name"] = "fake-publisher", ["version"] = "1" } }.ToJsonString(),
                     ct);
                 break;
 
@@ -233,17 +259,22 @@ internal sealed class FakeMcpPublisher : IAsyncDisposable
     /// sessions never use (forced <c>peer_supports_e2e=false</c> at admission).</summary>
     public async Task SendRawFrameAsync(string sessionId, byte[] payload, uint enc)
     {
-        await _call.RequestStream.WriteAsync(new NodeToGatewayMessage
+        await _writeGate.WaitAsync(_cts.Token);
+        try
         {
-            Frame = new RelayFrame
+            await _call.RequestStream.WriteAsync(new NodeToGatewayMessage
             {
-                SessionId = sessionId,
-                SequenceNumber = (ulong)Interlocked.Increment(ref _seq),
-                Direction = "server_to_client",
-                Ciphertext = ByteString.CopyFrom(payload),
-                Enc = enc,
-            }
-        });
+                Frame = new RelayFrame
+                {
+                    SessionId = sessionId,
+                    SequenceNumber = (ulong)Interlocked.Increment(ref _seq),
+                    Direction = "server_to_client",
+                    Ciphertext = ByteString.CopyFrom(payload),
+                    Enc = enc,
+                }
+            });
+        }
+        finally { _writeGate.Release(); }
     }
 
     private async Task ReplyAsync(string sessionId, JsonNode? id, string resultJson, CancellationToken ct)
@@ -255,17 +286,7 @@ internal sealed class FakeMcpPublisher : IAsyncDisposable
             ["result"] = JsonNode.Parse(resultJson),
         }.ToJsonString();
         var bytes = Encoding.UTF8.GetBytes(line + "\n");
-        await _call.RequestStream.WriteAsync(new NodeToGatewayMessage
-        {
-            Frame = new RelayFrame
-            {
-                SessionId = sessionId,
-                SequenceNumber = (ulong)Interlocked.Increment(ref _seq),
-                Direction = "server_to_client",
-                Ciphertext = ByteString.CopyFrom(bytes),
-                Enc = 0,
-            }
-        }).WaitAsync(ct);
+        await SendRawFrameAsync(sessionId, bytes, 0).WaitAsync(ct);
     }
 
     public async ValueTask DisposeAsync()

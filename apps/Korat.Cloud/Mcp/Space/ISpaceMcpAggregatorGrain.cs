@@ -100,6 +100,10 @@ public interface ISpaceMcpAggregatorGrain : IGrainWithStringKey
     /// </summary>
     Task<long> NextListChangedAsync(long knownCursor);
 
+    /// <summary>Claims coalesced catalog/resource invalidations for one stream. A notification
+    /// is returned to at most one caller; this is not a replay/event-history API.</summary>
+    Task<SpaceMcpNotifications> NextNotificationsAsync(long knownCursor, CancellationToken cancellationToken = default);
+
     /// <summary>
     /// Tears down every backend relay session this aggregator opened and unregisters the
     /// in-process delivery leg (plan-review correction S4). Called by the HTTP responder's
@@ -168,3 +172,5 @@ public interface ISpaceMcpAggregatorGrain : IGrainWithStringKey
     /// </param>
     Task OnDeliveryAsync(string backendSessionId, byte[] payload, uint enc, string? closeReason);
 }
+
+public sealed record SpaceMcpNotifications(long Cursor, string[] Messages);

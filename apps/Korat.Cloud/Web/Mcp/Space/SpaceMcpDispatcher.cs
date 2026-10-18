@@ -274,23 +274,26 @@ public sealed class SpaceMcpDispatcher(
             if (!BindingMatches(currentBinding, consumerIdentity, principal.SpaceId))
                 break;
 
-            long next;
+            SpaceMcpNotifications next;
             try
             {
-                next = await grain.NextListChangedAsync(cursor);
+                next = await grain.NextNotificationsAsync(cursor, ct);
             }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { break; }
             catch (Exception ex)
             {
-                logger.LogWarning(ex, "Space-MCP GET-SSE: NextListChangedAsync failed sessionId={SessionId}", sessionHeader);
+                logger.LogWarning(ex, "Space-MCP GET-SSE: notification poll failed sessionId={SessionId}", sessionHeader);
                 break;
             }
 
-            if (next > cursor)
+            cursor = next.Cursor;
+            if (next.Messages.Length > 0)
             {
-                cursor = next;
                 try
                 {
-                    await WriteListChangedEventAsync(ctx.Response, ct);
+                    if (!BindingMatches(await grain.GetBindingAsync(), consumerIdentity, principal.SpaceId)) break;
+                    foreach (var message in next.Messages)
+                        await WriteNotificationEventAsync(ctx.Response, message, ct);
                 }
                 catch
                 {
@@ -305,18 +308,9 @@ public sealed class SpaceMcpDispatcher(
             }
             else
             {
-                // MUST-FIX 2 (adversarial review, third pass): a heartbeat return (cursor
-                // unchanged) previously wrote ZERO bytes — a quiet watch stream sent nothing after
-                // the initial headers, and Fly's edge proxy severs a connection idle for ~60s; the
-                // client then reconnects with its cursor reset to 0, and THIS grain (whose own
-                // cursor is still > 0) reports a spurious list_changed on the very next poll. An
-                // SSE comment line (RFC-legal — any real SSE parser ignores a line starting with
-                // `:` as a comment, never surfacing it as a data event) keeps bytes flowing every
-                // ListChangedHeartbeat-ish interval (~15s, comfortably under Fly's ~60s idle
-                // cutoff) without ever emitting a semantically-meaningful notification. Bonus:
-                // surfaces a dead client within ≤15s instead of holding the grain-side session
-                // (and its backend relay sessions) open forever for a peer that vanished without a
-                // TCP RST.
+                // Comments keep an otherwise quiet stream alive across idle proxies without
+                // pretending the catalog changed. The 15s poll is also bounded below Orleans'
+                // grain-call timeout and detects a disconnected HTTP peer on the next write.
                 try
                 {
                     await WriteKeepAliveEventAsync(ctx.Response, ct);
@@ -432,9 +426,8 @@ public sealed class SpaceMcpDispatcher(
     private static bool AcceptsEventStream(HttpRequest request) =>
         request.Headers.Accept.ToString().Contains("text/event-stream", StringComparison.OrdinalIgnoreCase);
 
-    private static async Task WriteListChangedEventAsync(HttpResponse response, CancellationToken ct)
+    private static async Task WriteNotificationEventAsync(HttpResponse response, string payload, CancellationToken ct)
     {
-        var payload = JsonRpcMessage.Notification("notifications/tools/list_changed");
         var bytes = Encoding.UTF8.GetBytes($"event: message\ndata: {payload}\n\n");
         await response.Body.WriteAsync(bytes, ct);
         await response.Body.FlushAsync(ct);
@@ -444,8 +437,7 @@ public sealed class SpaceMcpDispatcher(
     /// the Server-Sent-Events spec (any line starting with `:` is a comment, silently ignored by
     /// every real SSE parser, never dispatched as a `message` event) — written on every heartbeat
     /// (cursor-unchanged) iteration of the GET-SSE loop so bytes keep flowing on an otherwise
-    /// quiet watch stream. See the loop's own call site for the full "Fly edge idle cutoff"
-    /// rationale.</summary>
+    /// quiet watch stream.</summary>
     private static async Task WriteKeepAliveEventAsync(HttpResponse response, CancellationToken ct)
     {
         var bytes = Encoding.UTF8.GetBytes(": keepalive\n\n");

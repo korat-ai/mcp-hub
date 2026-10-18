@@ -26,10 +26,15 @@ showing real availability, and inspecting relay activity.
 - Relays MCP traffic and records session metadata and byte counts, not payloads.
 - Exposes one aggregated Space-MCP endpoint for clients that want all of their
   approved servers behind one MCP connection.
+- Proxies tools, resources (including URI templates), and prompts through that
+  connection, with server-specific namespaces and revocable access.
 - Terminates active sessions when their permission is revoked.
 
 All of these operations are scoped to one **Space**. Korat does not route or
 grant access across Space boundaries.
+
+See [MCP resources and prompts](docs/mcp-content.md) for the protocol surface,
+namespacing, subscriptions, and the built-in Korat guide.
 
 ## Public product model
 

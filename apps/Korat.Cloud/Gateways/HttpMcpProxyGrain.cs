@@ -10,6 +10,7 @@ using Korat.Domain.Entities;
 using Korat.Domain.Persistence;
 using Korat.GrainInterfaces;
 using Korat.Mcp;
+using Orleans.Runtime;
 
 namespace Korat.Cloud.Gateways;
 
@@ -23,7 +24,7 @@ namespace Korat.Cloud.Gateways;
 /// One-way dispatch (Crux Finding 13): DispatchFrameAsync itself does almost no work — it
 /// get-or-creates the consumer's FIFO channel + worker task (starting one on first use) and
 /// synchronously enqueues the frame, extending this activation's lifetime past Orleans' idle-GC
-/// window (DelayDeactivation) — then returns immediately. The actual upstream call + push runs on
+/// window (DelayDeactivation plus a live-consumer grain timer) — then returns immediately. The actual upstream call + push runs on
 /// that consumer's own long-lived worker task (Finding 16, M6 — see RunConsumerWorkerAsync),
 /// never on this activation's Orleans turn, so one consumer's slow upstream call cannot block
 /// Orleans from processing this grain's NEXT call (another consumer's DispatchFrameAsync,
@@ -78,17 +79,16 @@ public sealed class HttpMcpProxyGrain(
     // one-way dispatch removes (Crux Finding 15). This codebase's own hosted-agent tools commonly
     // run minutes; 5 minutes leaves headroom without letting a truly hung remote leak forever.
     private static readonly TimeSpan UpstreamCallTimeout = TimeSpan.FromMinutes(5);
-    // Keeps this activation alive past Orleans' idle-GC window while a consumer's worker task is
-    // actively processing — comfortably above UpstreamCallTimeout. Refreshed on every
-    // DispatchFrameAsync call, so a session with live traffic never deactivates mid-flight; a
-    // genuinely idle session may still deactivate (its worker task then sits idle forever,
-    // blocked on an empty channel read — a pre-existing characteristic of this design this
-    // finding does not change or worsen, not a new leak M6 introduces).
+    // Dispatch grace protects startup/in-flight POSTs. External GET I/O is not Orleans
+    // activity: a KeepAlive grain timer preserves quiet sessions after this grace expires.
     private static readonly TimeSpan ActivationKeepAlive = TimeSpan.FromMinutes(10);
+    private IGrainTimer? _consumerKeepAliveTimer;
 
     private McpServer? _server;
     private string? _decryptedSecret;
     private readonly ConcurrentDictionary<string, ConsumerUpstream> _consumers = new();
+    // Long-lived GETs have a separate budget so they cannot consume all POST permits.
+    private readonly SemaphoreSlim _notificationStreams = new(32, 32);
 
     // Increment 2 (HTTP MCP OAuth), Task 5.
     private McpOAuthTokenDocument? _oauthToken;
@@ -157,15 +157,15 @@ public sealed class HttpMcpProxyGrain(
         await base.OnActivateAsync(cancellationToken);
     }
 
-    // Fable review (Task 5 hardening) Finding 3: intentionally NO OnDeactivateAsync override to
-    // dispose `_egressLimiter`. It holds no timer/unmanaged resource (verified against the
-    // ConcurrencyLimiter source — the MINOR #8 "queue/timer state" rationale that first motivated a
-    // dispose was inaccurate), so it is fully GC-reclaimed with the activation. Disposing it on
-    // deactivation would RACE the detached per-consumer workers, which run off the Orleans turn and
-    // are NOT drained by EvictAsync (inc-1 M7 deliberately does not await them): a worker calling
-    // `_egressLimiter.AcquireAsync` after a deactivation-time dispose would throw
-    // ObjectDisposedException, surfacing to the consumer as a misleading "Internal error." for every
-    // frame still draining. Leaving it undisposed is both leak-free and race-free.
+    public override Task OnDeactivateAsync(DeactivationReason reason, CancellationToken cancellationToken)
+    {
+        _consumerKeepAliveTimer?.Dispose();
+        _consumerKeepAliveTimer = null;
+        foreach (var consumer in _consumers.Values) ShutdownConsumer(consumer);
+        _consumers.Clear();
+        // Workers drain cancellation off-turn; they still own their leases and client disposal.
+        return base.OnDeactivateAsync(reason, cancellationToken);
+    }
 
     public Task DispatchFrameAsync(byte[] frameBytes, ConnectionId consumerConnectionId, SessionId consumerSessionId, CancellationToken cancellationToken)
     {
@@ -179,6 +179,14 @@ public sealed class HttpMcpProxyGrain(
         // though this method itself returns before the frame is processed.
         var consumer = _consumers.GetOrAdd(consumerSessionId.Value,
             _ => StartConsumer(consumerSessionId, consumerConnectionId));
+        _consumerKeepAliveTimer ??= this.RegisterGrainTimer(
+            static (grain, _) => grain.MaintainConsumerLifetimeAsync(), this,
+            new GrainTimerCreationOptions
+            {
+                DueTime = TimeSpan.Zero,
+                Period = TimeSpan.FromSeconds(30),
+                KeepAlive = true
+            });
         if (!consumer.Inbox.Writer.TryWrite(frameBytes))
             logger.LogWarning("HttpMcpProxyGrain: consumer inbox closed, frame dropped serverId={ServerId} session={SessionId}",
                 this.GetPrimaryKeyString(), consumerSessionId.Value);
@@ -186,11 +194,33 @@ public sealed class HttpMcpProxyGrain(
         return Task.CompletedTask;
     }
 
+    private Task MaintainConsumerLifetimeAsync()
+    {
+        // Runs on an Orleans turn. Detached workers can remove the last consumer after a
+        // terminal GET/payload failure; stop their keep-alive within one timer period too.
+        ReleaseConsumerKeepAliveIfEmpty();
+        return Task.CompletedTask;
+    }
+
+    private void ReleaseConsumerKeepAliveIfEmpty()
+    {
+        if (_consumers.Values.Any(consumer => !consumer.Stopping)) return;
+        _consumerKeepAliveTimer?.Dispose();
+        _consumerKeepAliveTimer = null;
+        DelayDeactivation(TimeSpan.Zero);
+    }
+
     private ConsumerUpstream StartConsumer(SessionId consumerSessionId, ConnectionId consumerConnectionId)
     {
-        var consumer = new ConsumerUpstream(
-            new HttpMcpClient(httpClientFactory.CreateClient("mcp-http-cloud"), _server?.RemoteUrl ?? string.Empty),
-            consumerConnectionId);
+        ConsumerUpstream? consumer = null;
+        consumer = new ConsumerUpstream(
+            new HttpMcpClient(httpClientFactory.CreateClient("mcp-http-cloud"), _server?.RemoteUrl ?? string.Empty,
+                async (notification, ct) =>
+                {
+                    ct.ThrowIfCancellationRequested();
+                    await PushResponseWithGrainOwnedCapAsync(consumerSessionId, consumer!, notification.ToUtf8Bytes());
+                }),
+            consumerConnectionId, consumerSessionId);
         // Detached — runs independently of this grain's Orleans turn (Crux Finding 13); NOT
         // awaited here. Exactly one such task exists per consumer session for its whole lifetime.
         consumer.WorkerTask = Task.Run(() => RunConsumerWorkerAsync(consumerSessionId, consumer));
@@ -215,12 +245,17 @@ public sealed class HttpMcpProxyGrain(
     {
         try
         {
-            await foreach (var frameBytes in consumer.Inbox.Reader.ReadAllAsync())
+            await foreach (var frameBytes in consumer.Inbox.Reader.ReadAllAsync(consumer.Lifetime.Token))
             {
+                if (consumer.Stopping) break;
                 byte[]? responseBytes;
                 try
                 {
                     responseBytes = await BuildResponseAsync(frameBytes, consumer);
+                }
+                catch (OperationCanceledException) when (consumer.Lifetime.IsCancellationRequested)
+                {
+                    break;
                 }
                 catch (Exception ex)
                 {
@@ -241,8 +276,8 @@ public sealed class HttpMcpProxyGrain(
                     // consumerSessionId (a stray/racing frame from before the consumer processes
                     // the close) starts a FRESH upstream instead of silently piling into a channel
                     // nobody is left draining once this loop exits below.
-                    consumer.Inbox.Writer.TryComplete();
-                    _consumers.TryRemove(consumerSessionId.Value, out _);
+                    ShutdownConsumer(consumer);
+                    _consumers.TryRemove(new KeyValuePair<string, ConsumerUpstream>(consumerSessionId.Value, consumer));
                     break;
                 }
                 // Fable gate FIX 2: PushOutcome.Undeliverable (a plain, transient delivery failure)
@@ -251,6 +286,7 @@ public sealed class HttpMcpProxyGrain(
                 // bridge-disconnect / peer-initiated CloseSession), not here. Keep draining.
             }
         }
+        catch (OperationCanceledException) when (consumer.Lifetime.IsCancellationRequested) { }
         finally
         {
             // Finding 16, M7 (this review pass): the worker OWNS its client's disposal and disposes
@@ -259,7 +295,106 @@ public sealed class HttpMcpProxyGrain(
             // never has to await this task on the grain turn (see ShutdownConsumer). No
             // disposed-client race remains: nothing touches consumer.Client once the loop exits, and
             // the loop only exits after the last in-flight upstream call has returned.
+            ShutdownConsumer(consumer);
+            _consumers.TryRemove(new KeyValuePair<string, ConsumerUpstream>(consumerSessionId.Value, consumer));
             consumer.Client.Dispose();
+            await consumer.NotificationTask;
+            consumer.DisposeLifetime();
+            consumer.PushGate.Dispose();
+        }
+    }
+
+    private async Task RunNotificationsAsync(ConsumerUpstream consumer, Action<HttpRequestMessage> injectAuth)
+    {
+        var ct = consumer.NotificationLifetime.Token;
+        var acquired = false;
+        try
+        {
+            acquired = await _notificationStreams.WaitAsync(0, ct);
+            if (acquired)
+            {
+                var refreshed = false;
+                for (var attempt = 0; attempt < 3; attempt++)
+                {
+                    if (attempt > 0)
+                        await Task.Delay(TimeSpan.FromSeconds(attempt), ct);
+                    var observedToken = _oauthToken;
+                    try
+                    {
+                        // No replay cursor: these are fresh streams for the same upstream
+                        // session, not a claim of lossless event resumption.
+                        if (!await consumer.Client.ListenForNotificationsAsync(injectAuth,
+                            PayloadLimitPolicy.DefaultPerMessageBytes, PayloadLimitPolicy.DefaultSessionHardLimitBytes,
+                            ct))
+                            return; // 405: POST-only is a normal negotiated transport option.
+                    }
+                    catch (HttpMcpUnauthorizedException) when (_server is not null
+                        && McpServerAuthModes.IsOAuth(_server.AuthMode) && !refreshed)
+                    {
+                        refreshed = true;
+                        if (!await RefreshOAuthTokenSingleFlightAsync(observedToken, ct)) break;
+                    }
+                    catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+                    catch (Exception)
+                    {
+                        // Bounded retry only, without logging possibly secret-bearing exceptions.
+                    }
+                }
+            }
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { return; }
+        finally { if (acquired) _notificationStreams.Release(); }
+
+        // Capacity exhaustion and terminal EOF/failure must be observable. Back off even when
+        // no GET could start, so aggregator reopen+resubscribe cannot become a hot reconnect loop.
+        try
+        {
+            await Task.Delay(TimeSpan.FromSeconds(4), ct);
+            await consumer.PushGate.WaitAsync(ct);
+            try
+            {
+                if (!_consumers.TryRemove(new KeyValuePair<string, ConsumerUpstream>(consumer.SessionId.Value, consumer))) return;
+                ShutdownConsumer(consumer);
+                routingTable.CloseSession(consumer.SessionId);
+                await PersistClosedAsync(consumer.SessionId);
+                using var timeout = new CancellationTokenSource(UpstreamCallTimeout);
+                await routingTable.SendToConnectionAsync(consumer.ConnectionId, new Korat.Relay.V1.GatewayToNodeMessage
+                {
+                    CloseSession = new Korat.Relay.V1.CloseSession
+                    {
+                        SessionId = consumer.SessionId.Value,
+                        Reason = "upstream_notifications_unavailable"
+                    }
+                }, CancellationToken.None).WaitAsync(timeout.Token);
+            }
+            finally { consumer.PushGate.Release(); }
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception) { logger.LogWarning("HttpMcpProxyGrain: notification transport close was undeliverable"); }
+    }
+
+    private void StartNotifications(ConsumerUpstream consumer, Action<HttpRequestMessage> injectAuth)
+    {
+        if (consumer.NotificationsStarted || consumer.Stopping || !consumer.Client.SupportsNotifications) return;
+        consumer.NotificationsStarted = true; // only the per-consumer FIFO worker writes this
+        consumer.NotificationTask = RunNotificationsAsync(consumer, injectAuth);
+    }
+
+    private async Task PersistClosedAsync(SessionId sessionId)
+    {
+        // Mirror SessionTerminator's durable leg without calling back into this proxy.
+        // Close locally first, then persist before advertising terminal closure to the peer.
+        try
+        {
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+            var session = await repository.GetSessionAsync(sessionId, timeout.Token);
+            if (session is not null && session.Status is not (SessionStatus.Closed or SessionStatus.Failed))
+                await grainFactory.GetGrain<ISessionGrain>(sessionId.Value)
+                    .CloseAsync(SessionCloseReason.ServerUnavailable).WaitAsync(timeout.Token);
+        }
+        catch (Exception)
+        {
+            logger.LogWarning("HttpMcpProxyGrain: persisting notification transport closure failed");
         }
     }
 
@@ -320,7 +455,8 @@ public sealed class HttpMcpProxyGrain(
 
         try
         {
-            using var cts = new CancellationTokenSource(UpstreamCallTimeout);
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(consumer.Lifetime.Token);
+            cts.CancelAfter(UpstreamCallTimeout);
 
             // Increment 2 (HTTP MCP OAuth), Task 5 (Grounding Note 8): one egress-cap lease per
             // DISPATCHED FRAME, acquired before any upstream call this frame makes (initialize
@@ -363,7 +499,7 @@ public sealed class HttpMcpProxyGrain(
                 // not a second/synthetic one. The response already carries the consumer's own id.
                 var initResponse = await SendWithOAuthRetryAsync(
                     () => consumer.Client.InitializeAsync(incoming, InjectAuth, PayloadLimitPolicy.DefaultPerMessageBytes, cts.Token), cts.Token);
-                consumer.Initialized = true;
+                consumer.Initialized = !initResponse.HasError;
                 return initResponse.ToUtf8Bytes();
             }
 
@@ -380,20 +516,14 @@ public sealed class HttpMcpProxyGrain(
                 if (incoming.Method == "notifications/initialized")
                     consumer.PastInitializedBarrier = true;
 
-                // Forward every notification upstream (including "notifications/initialized" —
-                // the UPSTREAM server's own handshake state machine needs to see it too, since
-                // this grain forwarded the consumer's real "initialize" as ITS real initialize
-                // above). Correction (Task 5 hardening, fable-flagged): an HTTP-STATUS failure
-                // here (e.g. a stale/revoked token drawing a 401) is NOT "caught by the outer
-                // catch below" — nothing throws for it. HttpMcpClient.SendNotificationAsync never
-                // inspects the response status code at all (see its own doc comment), so a
-                // non-2xx status is silently dropped with no refresh/signal (best-effort by
-                // design — a notification has no reply to fail). Only a NETWORK-level failure
-                // (HttpRequestException/OperationCanceledException) throws HttpMcpUpstreamException,
-                // which the outer catch below DOES handle. See FOLLOWUPS.md (Finding 5) for the
-                // deferred fix (classify 401 + one single-flight refresh + one re-send) — the
-                // barrier above has already lifted by then regardless.
-                await consumer.Client.SendNotificationAsync(incoming, InjectAuth, cts.Token);
+                // A failed initialized POST must not permanently disable the notification
+                // reader. Its bounded GET attempts either work or visibly close the session.
+                try { await consumer.Client.SendNotificationAsync(incoming, InjectAuth, cts.Token); }
+                finally
+                {
+                    if (incoming.Method == "notifications/initialized" && consumer.Initialized)
+                        StartNotifications(consumer, InjectAuth);
+                }
                 return null;
             }
 
@@ -405,10 +535,15 @@ public sealed class HttpMcpProxyGrain(
                 // session ourselves so it exists at all, then continue below. No
                 // "notifications/initialized" will ever arrive from a consumer that skipped
                 // "initialize" in the first place, so lift the barrier immediately too.
-                await SendWithOAuthRetryAsync(
+                var initialized = await SendWithOAuthRetryAsync(
                     () => consumer.Client.InitializeWithOwnRequestAsync(InjectAuth, PayloadLimitPolicy.DefaultPerMessageBytes, cts.Token), cts.Token);
+                if (initialized.HasError)
+                    return HttpMcpMessage.Error(incoming.Id, -32000, "Upstream MCP initialization failed.").ToUtf8Bytes();
+                await consumer.Client.SendNotificationAsync(
+                    HttpMcpMessage.Parse("""{"jsonrpc":"2.0","method":"notifications/initialized"}"""), InjectAuth, cts.Token);
                 consumer.Initialized = true;
                 consumer.PastInitializedBarrier = true;
+                StartNotifications(consumer, InjectAuth);
             }
 
             if (!consumer.PastInitializedBarrier)
@@ -701,29 +836,44 @@ public sealed class HttpMcpProxyGrain(
     /// </summary>
     private async Task<PushOutcome> PushResponseWithGrainOwnedCapAsync(SessionId consumerSessionId, ConsumerUpstream consumer, byte[] responseBytes)
     {
-        var newTotal = consumer.BytesPushed + responseBytes.LongLength;
-        if (newTotal > PayloadLimitPolicy.DefaultSessionHardLimitBytes)
+        // GET and POST may now push concurrently. Serialize both accounting and delivery so
+        // neither can undercount the shared budget or race the connection's stream writer.
+        await consumer.PushGate.WaitAsync(consumer.Lifetime.Token);
+        try
         {
-            logger.LogWarning(
-                "HttpMcpProxyGrain: grain-owned session_hard_limit exceeded serverId={ServerId} session={SessionId} totalBytes={TotalBytes}",
-                this.GetPrimaryKeyString(), consumerSessionId.Value, newTotal);
-            await routingTable.CloseForResponsePayloadLimitAsync(consumerSessionId, consumer.ConnectionId, CancellationToken.None);
-            return PushOutcome.CapExceeded;
-        }
-        consumer.BytesPushed = newTotal;
+            consumer.Lifetime.Token.ThrowIfCancellationRequested();
+            var wireBytes = responseBytes.LongLength + (responseBytes.Length == 0 || responseBytes[^1] != (byte)'\n' ? 1 : 0);
+            var newTotal = consumer.BytesPushed + wireBytes;
+            if (newTotal > PayloadLimitPolicy.DefaultSessionHardLimitBytes)
+            {
+                logger.LogWarning(
+                    "HttpMcpProxyGrain: grain-owned session_hard_limit exceeded serverId={ServerId} session={SessionId} totalBytes={TotalBytes}",
+                    this.GetPrimaryKeyString(), consumerSessionId.Value, newTotal);
+                // Remove only this generation; a racing close/reopen must not lose its new client.
+                _consumers.TryRemove(new KeyValuePair<string, ConsumerUpstream>(consumerSessionId.Value, consumer));
+                ShutdownConsumer(consumer);
+                using var closeTimeout = new CancellationTokenSource(UpstreamCallTimeout);
+                await routingTable.CloseForResponsePayloadLimitAsync(consumerSessionId, consumer.ConnectionId, CancellationToken.None)
+                    .WaitAsync(closeTimeout.Token);
+                return PushOutcome.CapExceeded;
+            }
+            consumer.BytesPushed = newTotal;
 
-        var delivered = await routingTable.PushHttpCloudResponseAsync(
-            consumerSessionId, consumer.ConnectionId, responseBytes, CancellationToken.None);
-        if (!delivered)
-        {
-            // Fable gate FIX 2: routine and transient (NATS reconnect window / oversized-for-NATS
-            // response / cross-silo placement) — NOT evidence the session was torn down. Logged,
-            // not escalated; the caller must keep draining rather than wedge the pipeline.
-            logger.LogWarning("HttpMcpProxyGrain: response undeliverable (transient) serverId={ServerId} session={SessionId}",
-                this.GetPrimaryKeyString(), consumerSessionId.Value);
-            return PushOutcome.Undeliverable;
+            var delivered = await routingTable.PushHttpCloudResponseAsync(
+                consumerSessionId, consumer.ConnectionId, responseBytes, CancellationToken.None)
+                .WaitAsync(consumer.Lifetime.Token);
+            if (!delivered)
+            {
+                // Fable gate FIX 2: routine and transient (NATS reconnect window / oversized-for-NATS
+                // response / cross-silo placement) — NOT evidence the session was torn down. Logged,
+                // not escalated; the caller must keep draining rather than wedge the pipeline.
+                logger.LogWarning("HttpMcpProxyGrain: response undeliverable (transient) serverId={ServerId} session={SessionId}",
+                    this.GetPrimaryKeyString(), consumerSessionId.Value);
+                return PushOutcome.Undeliverable;
+            }
+            return PushOutcome.Delivered;
         }
-        return PushOutcome.Delivered;
+        finally { consumer.PushGate.Release(); }
     }
 
     public Task CloseConsumerSessionAsync(SessionId consumerSessionId)
@@ -733,6 +883,7 @@ public sealed class HttpMcpProxyGrain(
         // awaiting would stall DispatchFrameAsync for every OTHER consumer of this same server).
         if (_consumers.TryRemove(consumerSessionId.Value, out var consumer))
             ShutdownConsumer(consumer);
+        ReleaseConsumerKeepAliveIfEmpty();
         return Task.CompletedTask;
     }
 
@@ -741,39 +892,41 @@ public sealed class HttpMcpProxyGrain(
         // Finding 16, M7: signal every worker to retire (non-blocking); each finishes its in-flight
         // frame and disposes its own client. DeactivateOnIdle then reloads config on next activation.
         foreach (var kvp in _consumers)
-            ShutdownConsumer(kvp.Value);
+            kvp.Value.Stop(finishInFlight: true);
         _consumers.Clear();
+        ReleaseConsumerKeepAliveIfEmpty();
         DeactivateOnIdle();
         return Task.CompletedTask;
     }
 
     /// <summary>
-    /// Finding 16, M7 (this review pass) — NON-BLOCKING close. Completes the consumer's inbox so
-    /// RunConsumerWorkerAsync drains its in-flight frame and then exits; the worker disposes its own
-    /// HttpMcpClient in its finally (see RunConsumerWorkerAsync). This deliberately does NOT await
-    /// the worker task: the worker can be mid-upstream-call for up to UpstreamCallTimeout (5 min),
-    /// and this grain is NOT [Reentrant] — awaiting here would hold the activation and stall
-    /// DispatchFrameAsync for EVERY OTHER consumer of this same server (one grain serves all
-    /// consumers of one McpServerId, and bridge-disconnect close is the single most common close
-    /// path — Finding 16, M1) for the whole call. Signalling completion and returning keeps close
-    /// O(1) and lets each worker retire itself. (The earlier M6 draft awaited the worker here to
-    /// order the dispose after the last use; the worker-owned finally achieves the same ordering
-    /// without the grain-turn stall.)
+    /// Non-blocking close cancels HTTP reads, pending pushes and the inbox. The worker joins its
+    /// GET task before disposing synchronization resources, outside the Orleans grain turn.
     /// </summary>
     private static void ShutdownConsumer(ConsumerUpstream consumer)
-        => consumer.Inbox.Writer.TryComplete();
+        => consumer.Stop();
 
     /// <summary>
     /// One consumer session's upstream MCP session state (Crux Finding 14). Finding 16, M6: FIFO
     /// via a Channel + exactly one worker task (replaces the SemaphoreSlim gate). Finding 16, M3:
     /// BytesPushed is the grain-owned, placement-independent cumulative response-byte counter.
     /// </summary>
-    private sealed class ConsumerUpstream(HttpMcpClient client, ConnectionId connectionId)
+    private sealed class ConsumerUpstream(HttpMcpClient client, ConnectionId connectionId, SessionId sessionId)
     {
         public HttpMcpClient Client { get; } = client;
         public ConnectionId ConnectionId { get; } = connectionId;
+        public SessionId SessionId { get; } = sessionId;
         public bool Initialized { get; set; }
         public bool PastInitializedBarrier { get; set; }
+        public bool NotificationsStarted { get; set; }
+        public Task NotificationTask { get; set; } = Task.CompletedTask;
+        public CancellationTokenSource Lifetime { get; } = new();
+        public CancellationTokenSource NotificationLifetime { get; } = new();
+        public SemaphoreSlim PushGate { get; } = new(1, 1);
+        private readonly object _stopLock = new();
+        private bool _disposed;
+        private volatile bool _stopping;
+        public bool Stopping => _stopping;
         public long BytesPushed { get; set; }
         public Channel<byte[]> Inbox { get; } = Channel.CreateUnbounded<byte[]>();
         /// <summary>Finding 16, M7: the fire-and-forget sink for StartConsumer's detached
@@ -781,5 +934,30 @@ public sealed class HttpMcpProxyGrain(
         /// awaited on close — the worker retires itself via its own finally, so ShutdownConsumer
         /// stays non-blocking. Retained as a diagnostic handle.</summary>
         public Task WorkerTask { get; set; } = Task.CompletedTask;
+
+        public void Stop(bool finishInFlight = false)
+        {
+            lock (_stopLock)
+            {
+                if (_disposed) return;
+                _stopping = true;
+                Inbox.Writer.TryComplete();
+                NotificationLifetime.Cancel();
+                // Eviction may be caused by THIS request's OAuth refresh failure. Preserve
+                // its bounded final error response, but stop GET immediately and drop queued
+                // frames. Explicit session close/cap/deactivation cancels everything.
+                if (!finishInFlight) Lifetime.Cancel();
+            }
+        }
+
+        public void DisposeLifetime()
+        {
+            lock (_stopLock)
+            {
+                _disposed = true;
+                Lifetime.Dispose();
+                NotificationLifetime.Dispose();
+            }
+        }
     }
 }

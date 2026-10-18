@@ -9,9 +9,8 @@ using Korat.Relay.V1;
 
 namespace Korat.Cloud.Mcp.Space;
 
-/// <summary>A single backend MCP tool as exposed through the aggregator (namespaced).</summary>
 /// <summary>
-/// Space-MCP (increment 1, Task 4): one relay session to a single granted backend MCP server,
+/// One relay session to a single granted backend MCP server,
 /// opened by <c>SpaceMcpAggregatorGrain</c> via <c>ISessionAdmission.AdmitAsync</c> with
 /// <c>ConsumerBindPolicy.ServerMinted</c>. Server-side port of
 /// <c>apps/Korat.Cli/Mcp/Aggregation/BackendSession.cs</c> with these deliberate deltas from the
@@ -55,7 +54,7 @@ internal sealed class SpaceBackendSession
     private const string McpProtocolVersion = "2025-06-18";
 
     /// <summary>
-    /// Timeout for handshake operations: initialize, tools/list. S9: also the per-backend
+    /// Timeout for handshake/discovery operations: initialize and catalog pages. Also the per-backend
     /// request timeout. <c>SpaceMcpAggregatorGrain</c>'s whole-open budget is longer because it
     /// also includes admission and an optional mobile wake wait.
     /// </summary>
@@ -72,6 +71,7 @@ internal sealed class SpaceBackendSession
     // Decoded-but-unconsumed inbound text. Frames may carry partial lines or several
     // complete lines; we split on '\n' and keep the remainder here.
     private readonly StringBuilder _buffer = new();
+    private readonly Decoder _decoder = Encoding.UTF8.GetDecoder();
     private readonly object _bufferLock = new();
 
     private long _reqId;
@@ -93,11 +93,19 @@ internal sealed class SpaceBackendSession
     public bool IsAlive => _isAlive;
     private volatile IReadOnlyList<ToolInfo> _tools = Array.Empty<ToolInfo>();
     public IReadOnlyList<ToolInfo> Tools => _tools;
+    public JsonObject Capabilities { get; private set; } = new();
+    public JsonArray Resources { get; private set; } = new();
+    public JsonArray ResourceTemplates { get; private set; } = new();
+    public JsonArray Prompts { get; private set; } = new();
+    public bool Supports(string capability) => Capabilities[capability] is JsonObject;
+    public bool SupportsSubscriptions => Capabilities["resources"] is JsonObject resources
+        && resources["subscribe"] is JsonValue v
+        && v.TryGetValue<bool>(out var enabled) && enabled;
 
-    /// <summary>Raised when the backend sends notifications/tools/list_changed. Invoked
+    /// <summary>Raised for backend notifications. Invoked
     /// synchronously — the caller (OnDeliveryAsync) already runs on the grain's own scheduler
     /// turn, unlike the CLI's dedicated drain-thread which needed Task.Run to avoid stalling.</summary>
-    public event Action? ToolsChanged;
+    public event Action<string, JsonObject?>? Notification;
 
     /// <summary>
     /// Sends a JSON-RPC request and awaits the response, subject to <paramref name="timeout"/>.
@@ -181,7 +189,9 @@ internal sealed class SpaceBackendSession
         var lines = new List<string>();
         lock (_bufferLock)
         {
-            _buffer.Append(Encoding.UTF8.GetString(bytes));
+            var chars = new char[Encoding.UTF8.GetMaxCharCount(bytes.Length)];
+            var count = _decoder.GetChars(bytes, 0, bytes.Length, chars, 0, flush: false);
+            _buffer.Append(chars, 0, count);
             var text = _buffer.ToString();
             int start = 0;
             int nl;
@@ -206,9 +216,9 @@ internal sealed class SpaceBackendSession
             {
                 if (_pending.TryRemove(id, out var tcs)) tcs.TrySetResult(m);
             }
-            else if (m.IsNotification && m.Method == "notifications/tools/list_changed")
+            else if (m.IsNotification && m.Method is { } method)
             {
-                ToolsChanged?.Invoke();
+                Notification?.Invoke(method, m.Params);
             }
             else if (m.Method is not null && m.Id is not null)
             {
@@ -249,16 +259,20 @@ internal sealed class SpaceBackendSession
                 ["version"] = "1",
             },
         };
-        _ = await SendRequestAsync("initialize", @params, ct, timeout);
+        var response = await SendRequestAsync("initialize", @params, ct, timeout);
+        var result = JsonNode.Parse(response.Raw())?["result"] as JsonObject
+            ?? throw new InvalidOperationException("Backend initialization failed.");
+        Capabilities = result["capabilities"] as JsonObject
+            ?? throw new InvalidOperationException("Backend omitted its capabilities.");
         await SendNotificationAsync("notifications/initialized", null, ct);
     }
 
     public async Task<IReadOnlyList<ToolInfo>> ListToolsAsync(CancellationToken ct, TimeSpan? handshakeTimeout = null)
     {
         var timeout = handshakeTimeout ?? HandshakeTimeout;
-        var resp = await SendRequestAsync("tools/list", null, ct, timeout);
-        var result = JsonNode.Parse(resp.Raw())!["result"];
-        var arr = result?["tools"] as JsonArray;
+        var arr = Supports("tools")
+            ? await ListAllAsync("tools/list", "tools", ct, timeout)
+            : new JsonArray();
         var list = new List<ToolInfo>();
         if (arr is not null)
         {
@@ -279,6 +293,57 @@ internal sealed class SpaceBackendSession
         }
         _tools = list;
         return list;
+    }
+
+    public async Task ListContentAsync(CancellationToken ct)
+    {
+        // Publish one complete snapshot: a failed page must not replace a good catalog with
+        // a truncated one. Not every server implements templates, even if it has resources.
+        var resources = Supports("resources")
+            ? await ListAllAsync("resources/list", "resources", ct, HandshakeTimeout) : new JsonArray();
+        var templates = Supports("resources")
+            ? await ListAllAsync("resources/templates/list", "resourceTemplates", ct, HandshakeTimeout, optional: true)
+            : new JsonArray();
+        var prompts = Supports("prompts")
+            ? await ListAllAsync("prompts/list", "prompts", ct, HandshakeTimeout) : new JsonArray();
+        Resources = resources;
+        ResourceTemplates = templates;
+        Prompts = prompts;
+    }
+
+    private async Task<JsonArray> ListAllAsync(string method, string field, CancellationToken ct,
+        TimeSpan timeout, bool optional = false)
+    {
+        var all = new JsonArray();
+        var cursors = new HashSet<string>(StringComparer.Ordinal);
+        string? cursor = null;
+        var totalBytes = 0;
+        for (var page = 0; page < 100; page++)
+        {
+            var response = await SendRequestAsync(method,
+                cursor is null ? null : new JsonObject { ["cursor"] = cursor }, ct, timeout);
+            var raw = response.Raw();
+            totalBytes += Encoding.UTF8.GetByteCount(raw);
+            if (totalBytes > 8 * 1024 * 1024)
+                throw new InvalidOperationException("Backend catalog exceeded the size limit.");
+            var envelope = JsonNode.Parse(raw)!;
+            if (optional && envelope["error"]?["code"] is JsonValue code
+                && code.TryGetValue<int>(out var c) && c == -32601 && cursor is null)
+                return all;
+            if (envelope["result"] is not JsonObject result || result[field] is not JsonArray items)
+                throw new InvalidOperationException($"Backend returned an invalid {method} page.");
+            foreach (var item in items)
+            {
+                if (all.Count >= 10_000)
+                    throw new InvalidOperationException("Backend catalog exceeded the item limit.");
+                all.Add(item?.DeepClone());
+            }
+            if (result["nextCursor"] is null) return all;
+            if (result["nextCursor"] is not JsonValue value || !value.TryGetValue<string>(out cursor)
+                || string.IsNullOrEmpty(cursor) || !cursors.Add(cursor))
+                throw new InvalidOperationException("Backend returned an invalid or repeated cursor.");
+        }
+        throw new InvalidOperationException("Backend catalog exceeded the page limit.");
     }
 }
 
