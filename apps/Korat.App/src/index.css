@@ -2,12 +2,12 @@
 @import "tw-animate-css";
 @import "@fontsource-variable/geist";
 @import "@fontsource-variable/geist-mono";
-@import "shadcn/tailwind.css";
+@import "./styles/vendor/shadcn-tailwind.css";
 
 @custom-variant dark (&:is(.dark *));
 
 /* ── LIGHT (override). Default page state is .dark ─────────────────────────── */
-/* These live AFTER the shadcn/tailwind.css import so warm-amber wins the cascade. */
+/* These follow the vendored shadcn styles so warm-amber wins the cascade. */
 :root,
 .light {
   color-scheme: light;

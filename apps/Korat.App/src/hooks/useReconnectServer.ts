@@ -17,7 +17,7 @@ export function useReconnectServer() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: ({ serverId }: ReconnectArgs) => api.mcpServers.reconnect(serverId),
-    onSuccess: (connect, _vars) => {
+    onSuccess: (connect) => {
       qc.invalidateQueries({ queryKey: queryKeys.space.all });
       if (connect.authorizeUrl) {
         window.location.href = connect.authorizeUrl;

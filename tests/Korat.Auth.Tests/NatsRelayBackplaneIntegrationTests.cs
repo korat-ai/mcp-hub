@@ -37,7 +37,7 @@ public class NatsRelayBackplaneIntegrationTests
         {
             try
             {
-                nats = new NatsBuilder().Build();
+                nats = new NatsBuilder("nats:2.9").Build();
                 await nats.StartAsync();
             }
             catch (Exception ex)

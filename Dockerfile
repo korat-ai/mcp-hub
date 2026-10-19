@@ -4,30 +4,19 @@
 # the ASP.NET Core slim base. One process per container: Kestrel serves REST on
 # :8080 and gRPC (h2c) on :8081, and the ingress in front terminates TLS for both.
 # Pin the exact SDK/runtime patch (not the floating 10.0 major.minor tag) so the image
-# build is reproducible and stays in lockstep with global.json (sdk 10.0.201). Bump both
-# together when moving SDK patch bands.
-# NOTE: the SDK and the ASP.NET runtime base are versioned on DIFFERENT schemes — the SDK
-# is 10.0.2xx (feature band) while the runtime is plain 10.0.N, and aspnet:10.0.201 does
-# not exist. Do NOT guess the pairing — the SDK states it:
-#   rg -o 'BundledNETCoreAppPackageVersion>([^<]+)' \
-#     /usr/local/share/dotnet/sdk/10.0.201/Microsoft.NETCoreSdk.BundledVersions.props
-# For 10.0.201 that is 10.0.5 — a FLOOR, not the value. The rule: never below what the SDK
-# bundles, and never below the latest servicing release. This was pinned at 10.0.2 for months
-# on the strength of the comment alone, shipping production three servicing releases behind —
-# invisible, because patch roll-forward means the app starts happily either way.
-#
-# 10.0.10 deliberately runs ahead of the SDK. 10.0.8, 10.0.9 and 10.0.10 are all flagged
-# security; waiting for the numbers to line up would mean leaving them unapplied. The reverse
-# direction is not allowed: code built by SDK 10.0.201 runs on 10.0.10, not the other way.
-ARG DOTNET_SDK_VERSION=10.0.201
-ARG ASPNET_RUNTIME_VERSION=10.0.10
+# build stays in lockstep with global.json. SDK and runtime use different version schemes:
+# the .NET 10 release metadata pairs SDK 10.0.402 with runtime 10.0.13.
+# NuGet audit does not cover assemblies supplied by the shared ASP.NET runtime, so update
+# this pin along with package references when applying security servicing releases.
+ARG DOTNET_SDK_VERSION=10.0.402
+ARG ASPNET_RUNTIME_VERSION=10.0.13
 
 FROM mcr.microsoft.com/dotnet/sdk:${DOTNET_SDK_VERSION} AS build
 WORKDIR /src
 
-# Install Node 20 for the frontend SPA build step that BuildKoratApp MSBuild target invokes.
+# Install supported Node 24 LTS for the frontend build (Node 20 is end-of-life).
 # `npm install` (not `npm ci`) runs by default; CI builds (where $CI=true) use `npm ci`.
-RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+RUN curl -fsSL https://deb.nodesource.com/setup_24.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
 

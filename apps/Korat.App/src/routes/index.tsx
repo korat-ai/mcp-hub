@@ -22,7 +22,7 @@ export const Route = createFileRoute('/')({
   component: Overview,
 });
 
-function StatCard({
+export function StatCard({
   label, value, sub, accent, to, onClick, scrollIcon,
 }: {
   label: string;
@@ -85,7 +85,7 @@ function statValue<TData>(
   return query.data === undefined ? '—' : render(query.data);
 }
 
-function Overview() {
+export function Overview() {
   const space = useSpace();
   const nowMs = useNow(8_000);
   const grants = useGrants();

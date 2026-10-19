@@ -22,7 +22,7 @@ export const Route = createFileRoute('/approve/$requestId')({
   component: ApprovePage,
 });
 
-function ApprovePage() {
+export function ApprovePage() {
   const { requestId } = Route.useParams();
 
   const req = useAccessRequest(requestId);

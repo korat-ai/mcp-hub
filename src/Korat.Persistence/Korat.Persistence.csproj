@@ -3,6 +3,8 @@
   <ItemGroup>
     <PackageReference Include="Microsoft.AspNetCore.DataProtection.EntityFrameworkCore" />
     <PackageReference Include="Microsoft.EntityFrameworkCore" />
+    <!-- Design is private: explicitly carry the matching relational runtime to consumers. -->
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Relational" />
     <PackageReference Include="OpenIddict.EntityFrameworkCore" />
     <PackageReference Include="Microsoft.EntityFrameworkCore.Design">
       <PrivateAssets>all</PrivateAssets>

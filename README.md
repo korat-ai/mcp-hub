@@ -54,7 +54,7 @@ record is easier to understand as a permission.
 
 ## Quick start
 
-Prerequisites are .NET 10, Node.js 20 or newer, npm, and Docker. The repository
+Prerequisites are the .NET 10 SDK specified in `global.json`, Node.js 24 LTS (or a newer supported LTS), npm, and Docker. The repository
 pins the .NET SDK feature band in [`global.json`](global.json).
 
 ```bash

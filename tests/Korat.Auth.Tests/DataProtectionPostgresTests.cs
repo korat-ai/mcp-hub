@@ -26,7 +26,7 @@ public class DataProtectionPostgresTests
         {
             try
             {
-                pg = new PostgreSqlBuilder().WithImage("postgres:16-alpine").Build();
+                pg = new PostgreSqlBuilder("postgres:16-alpine").Build();
                 await pg.StartAsync();
             }
             catch (Exception ex)

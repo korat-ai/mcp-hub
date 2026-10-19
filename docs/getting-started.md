@@ -5,8 +5,8 @@ consumer, and sends a JSON-RPC request through the relay.
 
 ## Prerequisites
 
-- .NET 10 SDK
-- Node.js 20 or newer and npm
+- The .NET 10 SDK specified in `global.json`
+- Node.js 24 LTS (or a newer supported LTS) and npm
 - Docker with Compose v2
 - a browser
 

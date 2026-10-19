@@ -24,12 +24,14 @@ vi.mock('@tanstack/react-router', async (importOriginal) => {
     Link: ({
       children,
       to,
-      search: _search,
-      params: _params,
+      search,
+      params,
       ...rest
-    }: React.AnchorHTMLAttributes<HTMLAnchorElement> & { to?: string; params?: unknown; search?: unknown }) => (
-      <a href={to} {...rest}>{children}</a>
-    ),
+    }: React.AnchorHTMLAttributes<HTMLAnchorElement> & { to?: string; params?: unknown; search?: unknown }) => {
+      void search;
+      void params;
+      return <a href={to} {...rest}>{children}</a>;
+    },
   };
 });
 

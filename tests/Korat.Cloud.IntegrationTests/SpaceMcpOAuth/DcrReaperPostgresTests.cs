@@ -51,8 +51,7 @@ public sealed class DcrReaperPostgresTests : IAsyncLifetime
     {
         try
         {
-            _postgres = new PostgreSqlBuilder()
-                .WithImage("postgres:16-alpine")
+            _postgres = new PostgreSqlBuilder("postgres:16-alpine")
                 .WithDatabase("korat_dcr_reaper_test")
                 .WithUsername("korat")
                 .WithPassword("korat")

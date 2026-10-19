@@ -9,7 +9,7 @@
  *  - Null-safety throughout
  */
 import { describe, expect, it } from 'vitest';
-import { resolveSpaceLabel } from './AppShell';
+import { resolveSpaceLabel } from './space-label';
 
 describe('resolveSpaceLabel', () => {
   // ── Legacy placeholder ─────────────────────────────────────────────────────

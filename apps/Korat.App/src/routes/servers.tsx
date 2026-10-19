@@ -44,7 +44,7 @@ export const Route = createFileRoute('/servers')({
 
 const HEADERS = ['Name', 'Publisher runtime', 'Status', ''];
 
-function ServersPage() {
+export function ServersPage() {
   const atDetail = useAtChildRoute('/servers/$serverId');
 
   const space = useSpace();

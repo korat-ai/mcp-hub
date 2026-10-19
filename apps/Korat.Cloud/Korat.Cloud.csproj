@@ -46,11 +46,41 @@
     <ProjectReference Include="..\..\src\Korat.Persistence\Korat.Persistence.csproj" />
   </ItemGroup>
 
-  <Target Name="BuildKoratApp" BeforeTargets="Build" Condition="'$(Configuration)' == 'Release'" Inputs="$(MSBuildThisFileDirectory)../Korat.App/package-lock.json;$(MSBuildThisFileDirectory)../Korat.App/index.html;$(MSBuildThisFileDirectory)../Korat.App/vite.config.ts;$(MSBuildThisFileDirectory)../Korat.App/tsconfig.json;$(MSBuildThisFileDirectory)../Korat.App/src/index.css;$(KoratAppForceBuildTrigger)" Outputs="$(MSBuildThisFileDirectory)wwwroot/app/index.html">
+  <ItemGroup>
+    <KoratAppInput Include="../Korat.App/src/**/*;../Korat.App/public/**/*;../Korat.App/package*.json;../Korat.App/index.html;../Korat.App/vite.config.ts;../Korat.App/tsconfig*.json"
+                   Exclude="../Korat.App/src/routeTree.gen.ts" />
+    <_KoratAppEvaluatedAsset Include="wwwroot/app/**" />
+  </ItemGroup>
+
+  <!-- A timestamp comparison alone cannot notice removed source/public files. -->
+  <Target Name="TrackKoratAppInputs" Condition="'$(Configuration)' == 'Release' And '$(DesignTimeBuild)' != 'true' And '$(NoBuild)' != 'true'">
+    <MakeDir Directories="$(IntermediateOutputPath)" />
+    <WriteLinesToFile File="$(IntermediateOutputPath)korat-app-inputs.txt" Lines="@(KoratAppInput)"
+                      Overwrite="true" WriteOnlyWhenDifferent="true" />
+    <ItemGroup>
+      <FileWrites Include="$(IntermediateOutputPath)korat-app-inputs.txt" />
+    </ItemGroup>
+  </Target>
+
+  <Target Name="BuildKoratApp" DependsOnTargets="TrackKoratAppInputs" Condition="'$(Configuration)' == 'Release' And '$(DesignTimeBuild)' != 'true' And '$(NoBuild)' != 'true'"
+          Inputs="@(KoratAppInput);$(IntermediateOutputPath)korat-app-inputs.txt;$(MSBuildProjectFullPath);$(KoratAppForceBuildTrigger)"
+          Outputs="$(MSBuildThisFileDirectory)wwwroot/app/index.html">
     <Message Importance="high" Text="Building Korat.App SPA (npm + vite build)..." />
     <Exec Command="npm ci" WorkingDirectory="$(MSBuildThisFileDirectory)../Korat.App" Condition="'$(CI)' == 'true' Or '$(KoratAppNpmCi)' == 'true'" />
     <Exec Command="npm install" WorkingDirectory="$(MSBuildThisFileDirectory)../Korat.App" Condition="'$(CI)' != 'true' And '$(KoratAppNpmCi)' != 'true'" />
     <Exec Command="npm run build" WorkingDirectory="$(MSBuildThisFileDirectory)../Korat.App" />
+  </Target>
+
+  <!-- Build before the SDK fingerprints/compresses assets. Refresh evaluation-time
+       globs even when npm is skipped: Vite replaces hashed filenames on each build. -->
+  <Target Name="IncludeKoratAppAssets" BeforeTargets="ResolveProjectStaticWebAssets"
+          DependsOnTargets="BuildKoratApp"
+          Condition="'$(Configuration)' == 'Release' And '$(DesignTimeBuild)' != 'true' And '$(NoBuild)' != 'true'">
+    <ItemGroup>
+      <!-- Remove the original item identities, including files Vite has since deleted. -->
+      <Content Remove="@(_KoratAppEvaluatedAsset)" />
+      <Content Include="wwwroot/app/**" CopyToPublishDirectory="PreserveNewest" ExcludeFromSingleFile="true" />
+    </ItemGroup>
   </Target>
 
   <Target Name="CleanKoratApp" BeforeTargets="Clean">
